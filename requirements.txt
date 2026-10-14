@@ -1,0 +1,3 @@
+telethon>=1.36
+# Optional but recommended: much faster decryption of downloads.
+cryptg

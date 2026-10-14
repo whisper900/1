@@ -1,0 +1,16 @@
+# Secrets: the session file is a logged-in copy of your Telegram account.
+.env
+*.session
+*.session-journal
+
+# Downloaded files
+downloads/
+
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/

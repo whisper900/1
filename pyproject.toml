@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tgdl"
+version = "0.1.0"
+description = "Download selected files from a Telegram chat into one folder per sender"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["telethon>=1.36"]
+
+[project.optional-dependencies]
+fast = ["cryptg"]
+test = ["pytest"]
+
+[project.scripts]
+tgdl = "tgdl.cli:main"
+
+[tool.setuptools]
+packages = ["tgdl"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
