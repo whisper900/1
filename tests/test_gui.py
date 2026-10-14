@@ -110,6 +110,8 @@ def test_login_then_choose_chat_then_download(app, tmp_path, no_dialogs):
     win.ext_edit.setText("pdf، docx")
     win.senders_edit.setText("Ahmed Ali, @sara")
     win.max_check.setChecked(True)
+    win.naming_combo.setCurrentIndex(win.naming_combo.findData("numbers"))
+    assert "1.jpg" in win.example_label.text()
     win.start(preview=False)
 
     _, chat_id, opts = worker.calls[-1]
@@ -120,6 +122,7 @@ def test_login_then_choose_chat_then_download(app, tmp_path, no_dialogs):
     assert opts.filter.senders == ["Ahmed Ali", "@sara"]
     assert opts.filter.max_size == 200 * 1024 * 1024
     assert opts.type_names["photo"] == "صور" and not opts.dry_run
+    assert opts.naming == "numbers"
     assert win.stop_btn.isEnabled() and not win.start_btn.isEnabled()
 
     worker.event.emit("progress", {"path": "a.pdf", "current": 50, "total": 100})
@@ -163,11 +166,13 @@ def test_preferences_are_remembered(app, tmp_path):
     win, _ = make_window(tmp_path)
     win.type_checks["sticker"].setChecked(True)
     win.chat_folder_check.setChecked(False)
+    win.naming_combo.setCurrentIndex(win.naming_combo.findData("numbers"))
     win.close()
     again = window_mod.MainWindow(config=Config(tmp_path / "settings.json"),
                                   worker=FakeWorker(), autostart=False)
     assert again.type_checks["sticker"].isChecked()
     assert not again.chat_folder_check.isChecked()
+    assert again.naming_combo.currentData() == "numbers"
     assert again.out_edit.text() == str(tmp_path / "out")
     again.close()
 

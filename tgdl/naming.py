@@ -103,3 +103,41 @@ def with_message_suffix(filename, msg_id):
     """``report.pdf`` -> ``report (msg 42).pdf`` to avoid name clashes."""
     path = Path(filename)
     return f"{path.stem} (msg {msg_id}){path.suffix}"
+
+
+# Files of one group share one number sequence: 1.jpg, 2.png, 3.jpg ...
+EXT_GROUPS = {
+    "images": {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".bmp",
+               ".tif", ".tiff", ".gif"},
+    "videos": {".mp4", ".mov", ".mkv", ".avi", ".webm", ".3gp", ".m4v", ".wmv", ".flv"},
+    "audio": {".mp3", ".m4a", ".ogg", ".oga", ".opus", ".wav", ".flac", ".aac",
+              ".wma", ".amr"},
+    "word": {".doc", ".docx", ".docm", ".dot", ".dotx", ".odt", ".rtf"},
+    "excel": {".xls", ".xlsx", ".xlsm", ".ods", ".csv"},
+    "powerpoint": {".ppt", ".pptx", ".pps", ".ppsx", ".odp"},
+    "pdf": {".pdf"},
+}
+_NUMBERED = re.compile(r"(\d+)(\.[^.]+)?")
+
+
+def ext_group(ext):
+    """Numbering group of an extension; other extensions are their own group."""
+    ext = (ext or "").lower()
+    for group, exts in EXT_GROUPS.items():
+        if ext in exts:
+            return group
+    return ext or "(none)"
+
+
+def highest_number(folder, group):
+    """Largest N among files named ``N.ext`` in ``folder`` whose ext is in ``group``."""
+    highest = 0
+    try:
+        entries = list(Path(folder).iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        match = _NUMBERED.fullmatch(entry.name)
+        if match and entry.is_file() and ext_group(match.group(2)) == group:
+            highest = max(highest, int(match.group(1)))
+    return highest

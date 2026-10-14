@@ -191,3 +191,48 @@ def test_events_for_graphical_front_ends(tmp_path):
     assert stats.scanned == 2
     assert files(tmp_path) == ["Ahmed Ali/document/a.pdf",
                                "Ahmed Ali/صور/photo_2025-01-01_12-00-00_2.jpg"]
+
+
+def test_numbered_names_have_one_sequence_per_group_and_sender(tmp_path):
+    client = FakeClient([
+        FakeMsg(1, AHMED, kind="photo", ext=".jpg", content=b"p1"),
+        FakeMsg(2, AHMED, name="تقرير.docx", content=b"d1"),
+        FakeMsg(3, AHMED, name="scan.PNG", content=b"p2"),       # still an image
+        FakeMsg(4, AHMED, name="old.doc", content=b"d2"),        # still Word
+        FakeMsg(5, AHMED, name="a.pdf", content=b"f1"),
+        FakeMsg(6, SARA, kind="photo", ext=".jpg", content=b"s1"),  # her own folder
+        FakeMsg(7, AHMED, name="b.pdf", content=b"f2"),
+        FakeMsg(8, AHMED, name="x.zip", content=b"z1"),
+        FakeMsg(9, AHMED, kind="photo", ext=".jpg", content=b"p3"),
+    ])
+    run(client, tmp_path, naming="numbers")
+    assert files(tmp_path) == [
+        "Family/Ahmed Ali/1.docx", "Family/Ahmed Ali/1.jpg", "Family/Ahmed Ali/1.pdf",
+        "Family/Ahmed Ali/1.zip", "Family/Ahmed Ali/2.doc", "Family/Ahmed Ali/2.pdf",
+        "Family/Ahmed Ali/2.png", "Family/Ahmed Ali/3.jpg", "Family/Sara/1.jpg",
+    ]
+    # Renaming only: the bytes are exactly what Telegram sent.
+    assert (tmp_path / "Family/Ahmed Ali/1.docx").read_bytes() == b"d1"
+    assert (tmp_path / "Family/Ahmed Ali/3.jpg").read_bytes() == b"p3"
+
+
+def test_numbering_continues_on_later_runs(tmp_path):
+    folder = tmp_path / "Family" / "Ahmed Ali"
+    folder.mkdir(parents=True)
+    (folder / "4.jpg").write_bytes(b"mine")      # user's own numbered file
+    (folder / "notes.txt").write_bytes(b"x")
+    msgs = [FakeMsg(1, AHMED, kind="photo", ext=".jpg", content=b"a")]
+    run(FakeClient(msgs), tmp_path, naming="numbers")
+    msgs.append(FakeMsg(2, AHMED, kind="photo", ext=".jpg", content=b"bb"))
+    client = FakeClient(msgs)
+    stats, _ = run(client, tmp_path, naming="numbers")
+    assert client.download_calls == [2]          # message 1 is not downloaded again
+    assert sorted(p.name for p in folder.iterdir()) == ["4.jpg", "5.jpg", "6.jpg", "notes.txt"]
+    assert (folder / "6.jpg").read_bytes() == b"bb"
+
+
+def test_numbered_dry_run_shows_names_without_writing(tmp_path):
+    client = FakeClient([FakeMsg(1, AHMED, name="a.pdf"), FakeMsg(2, AHMED, name="b.pdf")])
+    _, logs = run(client, tmp_path, naming="numbers", dry_run=True)
+    assert "1.pdf" in logs[0] and "2.pdf" in logs[1]
+    assert not any(tmp_path.iterdir())

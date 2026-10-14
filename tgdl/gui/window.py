@@ -10,7 +10,7 @@ from pathlib import Path
 from PySide6.QtCore import QDate, QStandardPaths, Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QIntValidator, QPixmap
 from PySide6.QtWidgets import (
-    QCheckBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
     QProgressBar, QProgressDialog, QPushButton, QSpinBox, QSplitter, QVBoxLayout,
@@ -390,6 +390,17 @@ class MainWindow(QMainWindow):
         out_row.addWidget(browse)
         self.chat_folder_check = QCheckBox("مجلد باسم المحادثة", checked=True)
         self.type_folder_check = QCheckBox("مجلد لكل نوع ملف داخل مجلد المرسل")
+        self.naming_combo = QComboBox()
+        self.naming_combo.addItem("الاسم الأصلي للملف", "original")
+        self.naming_combo.addItem("أرقام متسلسلة: 1، 2، 3 … (ترقيم منفصل لكل نوع)", "numbers")
+        self.naming_combo.setToolTip(
+            "الصور تُرقَّم 1، 2، 3… وملفات الوورد 1، 2، 3… وملفات PDF 1، 2، 3… وهكذا\n"
+            "لكل نوع داخل مجلد كل مرسل، حسب تاريخ الإرسال (الأقدم = 1).\n"
+            "يتغير اسم الملف فقط، ولا يُعدَّل محتواه إطلاقاً.")
+        self.naming_combo.currentIndexChanged.connect(self._update_example)
+        naming_row = QHBoxLayout()
+        naming_row.addWidget(QLabel("تسمية الملفات:"))
+        naming_row.addWidget(self.naming_combo, 1)
         for box in (self.chat_folder_check, self.type_folder_check):
             box.toggled.connect(self._update_example)
         self.example_label = QLabel()
@@ -400,6 +411,7 @@ class MainWindow(QMainWindow):
         where.addLayout(out_row)
         where.addWidget(self.chat_folder_check)
         where.addWidget(self.type_folder_check)
+        where.addLayout(naming_row)
         where.addWidget(self.example_label)
 
         options = QWidget()
@@ -468,6 +480,8 @@ class MainWindow(QMainWindow):
                 box.setChecked(kind in kinds)
         self.chat_folder_check.setChecked(cfg.get("chat_folder", True))
         self.type_folder_check.setChecked(cfg.get("type_folder", False))
+        index = self.naming_combo.findData(cfg.get("naming", "original"))
+        self.naming_combo.setCurrentIndex(max(index, 0))
         self._update_example()
 
     def _save_preferences(self):
@@ -476,6 +490,7 @@ class MainWindow(QMainWindow):
             kinds=[k for k, box in self.type_checks.items() if box.isChecked()],
             chat_folder=self.chat_folder_check.isChecked(),
             type_folder=self.type_folder_check.isChecked(),
+            naming=self.naming_combo.currentData(),
         )
         try:
             self.config.save()
@@ -497,7 +512,8 @@ class MainWindow(QMainWindow):
         parts.append("اسم المرسل")
         if self.type_folder_check.isChecked():
             parts.append("صور")
-        parts.append("الملف")
+        numbered = self.naming_combo.currentData() == "numbers"
+        parts.append("\u20681.jpg\u2069" if numbered else "الملف")
         self.example_label.setText("مثال: " + "  ›  ".join(parts))
 
     # -- state --------------------------------------------------------------
@@ -738,6 +754,7 @@ class MainWindow(QMainWindow):
             parallel=3,
             dry_run=preview,
             type_names=TYPE_FOLDERS,
+            naming=self.naming_combo.currentData(),
         )
 
     def start(self, preview=False):

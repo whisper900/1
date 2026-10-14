@@ -108,6 +108,10 @@ def build_parser():
                        help="output folder (default: downloads)")
     where.add_argument("--folder", default=DEFAULT_FOLDER,
                        help=f"sub-folder template (default: {DEFAULT_FOLDER})")
+    where.add_argument("--names", choices=("original", "numbers"), default="original",
+                       help="file names: the sender's original names, or numbers "
+                            "1, 2, 3... counted separately for images, videos, audio, "
+                            "Word, Excel, PowerPoint, PDF and each other extension")
 
     run = p.add_argument_group("running")
     run.add_argument("--list-chats", action="store_true",
@@ -228,6 +232,7 @@ async def amain(args):
             limit=args.limit,
             parallel=args.parallel,
             dry_run=args.dry_run,
+            naming=args.names,
         )
         print(f"Chat: {chat_name}  ->  {args.out.resolve()}")
         stats = await Downloader(client, chat, options, chat_name=chat_name).run()

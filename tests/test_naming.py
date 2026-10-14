@@ -60,3 +60,22 @@ def test_filenames():
     date = datetime(2025, 3, 4, 5, 6, 7)
     assert default_filename("photo", 42, date, ".jpg") == "photo_2025-03-04_05-06-07_42.jpg"
     assert with_message_suffix("report.pdf", 42) == "report (msg 42).pdf"
+
+
+def test_ext_groups():
+    from tgdl.naming import ext_group
+    assert ext_group(".JPG") == ext_group(".png") == "images"
+    assert ext_group(".doc") == ext_group(".docx") == "word"
+    assert ext_group(".pdf") == "pdf"
+    assert ext_group(".zip") == ".zip" and ext_group(".rar") == ".rar"
+    assert ext_group("") == "(none)"
+
+
+def test_highest_number(tmp_path):
+    from tgdl.naming import highest_number
+    for name in ("1.jpg", "7.png", "3.docx", "12.pdf", "9.jpg.part", "x5.jpg", "10"):
+        (tmp_path / name).write_bytes(b"")
+    assert highest_number(tmp_path, "images") == 7
+    assert highest_number(tmp_path, "word") == 3
+    assert highest_number(tmp_path, "(none)") == 10
+    assert highest_number(tmp_path / "missing", "images") == 0

@@ -10,8 +10,8 @@ from pathlib import Path
 from telethon import errors
 
 from .filters import MessageFilter, file_ext, media_kind
-from .naming import (default_filename, display_name, render_folder, sanitize,
-                     sender_fields, with_message_suffix)
+from .naming import (default_filename, display_name, ext_group, highest_number,
+                     render_folder, sanitize, sender_fields, with_message_suffix)
 from .state import DownloadLog
 
 DEFAULT_FOLDER = "{chat}/{sender}"
@@ -32,6 +32,9 @@ class Options:
     dry_run: bool = False
     retries: int = 3
     type_names: dict = field(default_factory=dict)  # kind -> {type} folder name
+    # "original": keep the sender's file name. "numbers": 1.jpg, 2.jpg, ... with
+    # a separate sequence per folder and file group (images, Word, PDF, ...).
+    naming: str = "original"
 
 
 @dataclass
@@ -76,6 +79,7 @@ class Downloader:
         self.out_dir = Path(options.out_dir)
         self.state = DownloadLog(self.out_dir / ".tgdl" / f"{chat.id}.tsv")
         self._reserved = set()
+        self._counters = {}       # (folder, ext group) -> last number given
         self._me = None
         self._sleep = asyncio.sleep
         self._show_progress = (options.parallel == 1 and sys.stdout.isatty()
@@ -168,7 +172,9 @@ class Downloader:
             **sender_fields(sender),
         }
         folder = self.out_dir / render_folder(self.opts.folder, fields)
-        if msg.file.name:
+        if self.opts.naming == "numbers":
+            name = self._next_number(folder, file_ext(msg))
+        elif msg.file.name:
             name = sanitize(msg.file.name)
         else:
             name = default_filename(kind, msg.id, msg.date, file_ext(msg))
@@ -189,6 +195,19 @@ class Downloader:
             self._reserved.add(candidate)
             return candidate
         raise AssertionError("unreachable: suffixed name is unique per message")
+
+    def _next_number(self, folder, ext):
+        """``"7.docx"``: one past the highest number already used in this group.
+
+        Existing files are counted, so a later run continues the sequence.
+        Numbers follow message order (oldest first) because they are handed
+        out while planning, before the parallel downloads start.
+        """
+        key = (folder, ext_group(ext))
+        if key not in self._counters:
+            self._counters[key] = highest_number(folder, key[1])
+        self._counters[key] += 1
+        return f"{self._counters[key]}{ext}"
 
     async def _download(self, msg, target):
         rel = target.relative_to(self.out_dir)
