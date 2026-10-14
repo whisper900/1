@@ -36,18 +36,17 @@ def main(argv=None):
             pass
 
     from PySide6.QtCore import Qt
-    from PySide6.QtGui import QFont, QIcon
+    from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
 
     from .config import Config
+    from .theme import apply_theme
     from .window import APP_TITLE, MainWindow
 
     app = QApplication(argv)
     app.setApplicationName(APP_TITLE)
     app.setLayoutDirection(Qt.RightToLeft)
-    font = QFont(app.font())
-    font.setPointSize(max(font.pointSize(), 10))
-    app.setFont(font)
+    apply_theme(app)
     icon = resource("icon.png")
     if icon.exists():
         app.setWindowIcon(QIcon(str(icon)))

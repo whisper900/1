@@ -87,10 +87,9 @@ class FakeWorker(QObject):
 
 def make_window(tmp_path):
     config = Config(tmp_path / "settings.json")
-    config.update(api_id=1, api_hash="0" * 32)
+    config.update(api_id=1, api_hash="0" * 32, out_dir=str(tmp_path / "out"))
     worker = FakeWorker()
     win = window_mod.MainWindow(config=config, worker=worker, autostart=False)
-    win.out_edit.setText(str(tmp_path / "out"))
     win.chat_cache_path = tmp_path / "chats.json"
     return win, worker
 
@@ -110,13 +109,11 @@ def test_login_then_choose_chat_then_download(app, tmp_path, no_dialogs):
     win.chat_list.setCurrentRow(0)
     assert win.start_btn.isEnabled()
 
-    win.type_checks["video"].setChecked(False)
-    win.type_folder_check.setChecked(True)
-    win.ext_edit.setText("pdf، docx")
-    win.senders_edit.setText("Ahmed Ali, @sara")
-    win.max_check.setChecked(True)
-    win.naming_combo.setCurrentIndex(win.naming_combo.findData("numbers"))
-    assert "1.jpg" in win.example_label.text()
+    win.config.update(kinds=["photo", "document", "audio", "voice", "video_note", "gif"],
+                      type_folder=True, exts="pdf، docx", senders="Ahmed Ali, @sara",
+                      max_on=True, max_mb=200, naming="numbers")
+    win._refresh_summary()
+    assert win.pages.currentIndex() == 1                    # the chat page is shown
     win.start(preview=False)
 
     _, chat_id, opts = worker.calls[-1]
@@ -153,13 +150,12 @@ def test_preview_and_validation(app, tmp_path, no_dialogs):
     worker.job_done.emit("chats", [(1, "Work", "group", "")])
     win.chat_list.setCurrentRow(0)
 
-    for box in win.type_checks.values():
-        box.setChecked(False)
+    win.config["kinds"] = []
     win.start(preview=True)
-    assert ("warning", "اختر نوعاً واحداً من الملفات على الأقل.") in no_dialogs
+    assert any("اختر نوعاً واحداً" in text for kind, text in no_dialogs if kind == "warning")
     assert not any(c[0] == "download" for c in worker.calls)
 
-    win.type_checks["document"].setChecked(True)
+    win.config["kinds"] = ["document"]
     win.start(preview=True)
     assert worker.calls[-1][2].dry_run
     worker.job_done.emit("preview", Stats(matched=5, queued=5, bytes=5 * 1024 ** 2))
@@ -167,19 +163,77 @@ def test_preview_and_validation(app, tmp_path, no_dialogs):
     win.close()
 
 
-def test_preferences_are_remembered(app, tmp_path):
-    win, _ = make_window(tmp_path)
-    win.type_checks["sticker"].setChecked(True)
-    win.chat_folder_check.setChecked(False)
-    win.naming_combo.setCurrentIndex(win.naming_combo.findData("numbers"))
+def test_empty_page_until_a_chat_is_chosen(app, tmp_path):
+    win, worker = make_window(tmp_path)
+    assert win.pages.currentIndex() == 0 and not win.empty_login_btn.isHidden()
+    assert "سجّل الدخول" in win.empty_text.text()
+    win.login()
+    worker.job_done.emit("login", "Ahmed")
+    worker.job_done.emit("chats", [(1, "Work", "group", "")])
+    assert win.pages.currentIndex() == 0 and "اختر محادثة" in win.empty_title.text()
+    win.chat_list.setCurrentRow(0)
+    assert win.pages.currentIndex() == 1 and win.chat_name.text() == "Work"
     win.close()
-    again = window_mod.MainWindow(config=Config(tmp_path / "settings.json"),
-                                  worker=FakeWorker(), autostart=False)
-    assert again.type_checks["sticker"].isChecked()
-    assert not again.chat_folder_check.isChecked()
-    assert again.naming_combo.currentData() == "numbers"
-    assert again.out_edit.text() == str(tmp_path / "out")
-    again.close()
+
+
+def test_settings_dialog_saves_everything(app, tmp_path, no_dialogs):
+    from tgdl.gui.settings import SettingsDialog, build_options, summary
+    config = Config(tmp_path / "settings.json")
+    dialog = SettingsDialog(config, require_api=True)
+    dialog.type_buttons["sticker"].setChecked(True)
+    dialog.type_buttons["video"].setChecked(False)
+    dialog.ext_edit.setText("pdf")
+    dialog.chat_folder_check.setChecked(False)
+    dialog.naming_combo.setCurrentIndex(dialog.naming_combo.findData("numbers"))
+    dialog.out_edit.setText(str(tmp_path / "out"))
+    assert "1.jpg" in dialog.example_label.text()
+
+    dialog._save()                                   # API is required here
+    assert any("API ID" in text for _, text in no_dialogs)
+    assert dialog.tabs.currentIndex() == 2
+    dialog.api_id.setText("12345")
+    dialog.api_hash.setText("ab" * 16)
+    dialog._save()
+
+    saved = Config(tmp_path / "settings.json")       # read back from disk
+    assert saved["api_id"] == 12345 and saved.has_api
+    opts = build_options(saved)
+    assert "sticker" in opts.filter.kinds and "video" not in opts.filter.kinds
+    assert opts.filter.exts == {".pdf"} and opts.folder == "{sender}"
+    assert opts.naming == "numbers" and opts.out_dir == tmp_path / "out"
+    lines = dict(summary(saved))
+    assert "pdf" in lines["التصفية"] and lines["التسمية"].startswith("أرقام")
+
+
+def test_settings_dialog_rejects_no_types_and_bad_dates(app, tmp_path, no_dialogs):
+    from PySide6.QtCore import QDate
+    from tgdl.gui.settings import SettingsDialog
+    config = Config(tmp_path / "settings.json")
+    dialog = SettingsDialog(config)
+    for button in dialog.type_buttons.values():
+        button.setChecked(False)
+    dialog._save()
+    assert any("نوعاً واحداً" in text for _, text in no_dialogs)
+    dialog.type_buttons["photo"].setChecked(True)
+    dialog.since_check.setChecked(True)
+    dialog.until_check.setChecked(True)
+    dialog.since_date.setDate(QDate(2025, 5, 1))
+    dialog.until_date.setDate(QDate(2025, 4, 1))
+    dialog._save()
+    assert any("تاريخ البداية" in text for _, text in no_dialogs)
+    assert not (tmp_path / "settings.json").exists()
+
+
+def test_build_options_dates():
+    from datetime import timedelta
+    from tgdl.gui.settings import build_options
+    config = {"since_on": True, "since": "2025-03-01", "until_on": True, "until": "2025-03-31"}
+    opts = build_options(config)
+    assert opts.since.date().isoformat() == "2025-03-01"
+    assert opts.until - opts.since == timedelta(days=31)       # until is inclusive
+    with pytest.raises(ValueError):
+        build_options({"since_on": True, "since": "2025-04-01",
+                       "until_on": True, "until": "2025-03-01"})
 
 
 # -- the real worker's thread bridge and login flow ---------------------------
@@ -459,7 +513,7 @@ def test_saved_chats_show_at_once_and_refresh_in_background(app, tmp_path):
     worker.job_done.emit("chats", CHATS)
     assert win.chat_list.count() == 3
     assert win.chat_list.currentItem().data(Qt.UserRole) == 42   # still selected
-    assert "(3)" in win.chats_box.title()
+    assert win.chats_count.text() == "3"
     assert load_chat_cache(99, win.chat_cache_path) == CHATS
     assert load_chat_cache(100, win.chat_cache_path) == []  # other account
     win.close()
