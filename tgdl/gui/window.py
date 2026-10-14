@@ -4,6 +4,7 @@ import asyncio
 import io
 import re
 import sys
+import time as clock
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
@@ -21,11 +22,23 @@ from .. import __version__
 from ..downloader import Options
 from ..filters import MessageFilter, normalize_exts
 from . import updater
-from .config import (Config, clear_chat_cache, load_chat_cache, save_chat_cache,
-                     session_path)
+from .config import (Config, chat_cache_age, clear_chat_cache, load_chat_cache,
+                     save_chat_cache, session_path)
 from .worker import RESEND, LoginCancelled, TelegramWorker, friendly_error
 
 APP_TITLE = "منزّل ملفات تليكرام"
+# A saved chat list younger than this is shown without asking Telegram again
+# (every full refresh counts against Telegram's rate limit).
+CHAT_REFRESH_AFTER = 10 * 60
+# What Telegram is rate-limiting, by request name.
+WAIT_REASONS = {
+    "GetDialogsRequest": "أثناء تحديث قائمة المحادثات",
+    "GetHistoryRequest": "أثناء قراءة رسائل المحادثة",
+    "SearchRequest": "أثناء قراءة رسائل المحادثة",
+    "GetMessagesRequest": "أثناء قراءة رسائل المحادثة",
+    "GetChannelMessagesRequest": "أثناء قراءة رسائل المحادثة",
+    "GetFileRequest": "أثناء تنزيل الملفات",
+}
 
 # kind, label, checked by default
 TYPE_CHOICES = [
@@ -414,6 +427,11 @@ class MainWindow(QMainWindow):
         self.chats_future = None     # chat list refresh runs beside other jobs
         self.showing_saved_chats = False
         self.chat_cache_path = None  # None = the app's settings folder
+        self.wait_until = 0.0        # end of Telegram's current rate-limit wait
+        self.wait_label = None
+        self.wait_text = ""
+        self.wait_timer = QTimer(self, interval=1000)
+        self.wait_timer.timeout.connect(self._tick_wait)
         self.updater = updater.Updater()
 
         self.setWindowTitle(f"{APP_TITLE} — الإصدار {__version__}")
@@ -896,11 +914,28 @@ class MainWindow(QMainWindow):
             self._show_chats(chats)
             self.chats_status.setText(f"تم تحميل {len(chats)} محادثة حتى الآن...")
 
-    def _on_flood_wait(self, seconds):
-        text = f"⏳ طلب تليكرام الانتظار {seconds} ثانية، سيكمل البرنامج تلقائياً..."
-        self.log(text)
-        if self.chats_future is not None:
-            self.chats_status.setText(text)
+    def _on_flood_wait(self, seconds, request=""):
+        reason = WAIT_REASONS.get(request, "")
+        self.log(f"⏳ طلب تليكرام الانتظار {seconds} ثانية {reason}. هذا طبيعي، "
+                 "وسيكمل البرنامج تلقائياً.".replace("  ", " "))
+        chats = request == "GetDialogsRequest" or (self.chats_future is not None
+                                                   and self.job is None)
+        self.wait_label = self.chats_status if chats else self.current_label
+        self.wait_text = reason
+        self.wait_until = clock.monotonic() + seconds
+        self._tick_wait()
+        self.wait_timer.start()
+
+    def _tick_wait(self):
+        left = round(self.wait_until - clock.monotonic())
+        if left <= 0 or self.wait_label is None:
+            self.wait_timer.stop()
+            if self.wait_label is not None and self.wait_label.text().startswith("⏳"):
+                self.wait_label.setText("")
+            return
+        reason = f" {self.wait_text}" if self.wait_text else ""
+        self.wait_label.setText(f"⏳ تليكرام طلب الانتظار{reason}: باقي {left} ثانية، "
+                                "ثم يكمل البرنامج تلقائياً.")
 
     def _chats_loaded(self, chats):
         self.chats_future = None
@@ -1096,11 +1131,17 @@ class MainWindow(QMainWindow):
             self.logged_in = True
             self.account_label.setText(f"الحساب: {result}")
             saved = load_chat_cache(self.worker.me_id, self.chat_cache_path)
+            age = chat_cache_age(self.worker.me_id, self.chat_cache_path)
             if saved:
                 self._show_chats(saved)
                 self.showing_saved_chats = True
             self._update_state()
-            self.load_chats()
+            if saved and age is not None and age < CHAT_REFRESH_AFTER:
+                minutes = max(1, round(age / 60))
+                self.chats_status.setText(f"القائمة محدّثة قبل {minutes} دقيقة. "
+                                          "اضغط «تحديث القائمة» لتحديثها الآن.")
+            else:
+                self.load_chats()
         elif name in ("download", "preview"):
             self._finish_download(result)
         elif name == "scan":

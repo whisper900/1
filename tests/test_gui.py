@@ -43,7 +43,7 @@ class FakeWorker(QObject):
     qr = Signal(str)
     notice = Signal(str)
     chats_partial = Signal(list)
-    flood_wait = Signal(int)
+    flood_wait = Signal(int, str)
     job_done = Signal(str, object)
     job_failed = Signal(str, object)
     event = Signal(str, dict)
@@ -427,6 +427,14 @@ def test_qr_dialog_in_window(app, tmp_path):
 
 from tgdl.gui.config import load_chat_cache, save_chat_cache  # noqa: E402
 
+def age_cache(path, seconds=3600):
+    import json
+    import time as clock
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["saved_at"] = clock.time() - seconds
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
 CHATS = [(-1001, "العائلة", "group", "pinned"), (42, "Sara", "user", ""),
          (7, "Work", "group", "archived")]
 
@@ -435,6 +443,7 @@ def test_saved_chats_show_at_once_and_refresh_in_background(app, tmp_path):
     win, worker = make_window(tmp_path)
     worker.me_id = 99
     save_chat_cache(99, CHATS[:2], win.chat_cache_path)
+    age_cache(win.chat_cache_path)
 
     win.login()
     worker.job_done.emit("login", "Ahmed")
@@ -463,8 +472,9 @@ def test_first_load_fills_progressively_and_shows_waits(app, tmp_path):
     worker.chats_partial.emit(CHATS[:2])
     assert win.chat_list.count() == 2
     assert "2" in win.chats_status.text()
-    worker.flood_wait.emit(35)
+    worker.flood_wait.emit(35, "GetDialogsRequest")
     assert "35" in win.chats_status.text() and "35" in win.log_view.toPlainText()
+    assert "قائمة المحادثات" in win.chats_status.text()
     worker.job_done.emit("chats", CHATS)
     assert win.chat_list.count() == 3 and win.chats_status.text() == ""
     win.close()
@@ -474,14 +484,14 @@ def test_flood_wait_log_line_becomes_signal():
     import logging
     from tgdl.gui.worker import _FloodWaitLog
     seen = []
-    handler = _FloodWaitLog(seen.append)
+    handler = _FloodWaitLog(lambda seconds, request: seen.append((seconds, request)))
     record = logging.LogRecord("telethon.client.users", logging.INFO, "", 0,
                                "Sleeping%s for %ds (%s) on %s flood wait",
                                ("", 35, "0:00:35", "GetDialogsRequest"), None)
     handler.emit(record)
     other = logging.LogRecord("x", logging.INFO, "", 0, "connected", (), None)
     handler.emit(other)
-    assert seen == [35]
+    assert seen == [(35, "GetDialogsRequest")]
 
 
 def test_download_from_saved_list_resolves_chat(app, tmp_path):
@@ -604,4 +614,44 @@ def test_pick_files_then_download_only_those(app, tmp_path, monkeypatch, no_dial
     win.pick_files()
     worker.job_done.emit("scan", ([], Stats(skipped=3)))
     assert any("لا توجد ملفات جديدة" in text for _, text in no_dialogs)
+    win.close()
+
+
+
+def test_fresh_saved_list_is_not_refetched(app, tmp_path):
+    win, worker = make_window(tmp_path)
+    worker.me_id = 99
+    save_chat_cache(99, CHATS, win.chat_cache_path)
+    win.login()
+    worker.job_done.emit("login", "Ahmed")
+    assert win.chat_list.count() == 3
+    assert worker.submitted == ["login"]                     # no GetDialogs storm
+    assert "تحديث القائمة" in win.chats_status.text()
+    win.load_chats()                                          # the button still works
+    assert worker.submitted[-1] == "chats"
+    win.close()
+
+
+def test_stale_saved_list_is_refreshed(app, tmp_path):
+    win, worker = make_window(tmp_path)
+    worker.me_id = 99
+    save_chat_cache(99, CHATS, win.chat_cache_path)
+    age_cache(win.chat_cache_path)
+    win.login()
+    worker.job_done.emit("login", "Ahmed")
+    assert worker.submitted[-1] == "chats"
+    win.close()
+
+
+def test_wait_countdown_during_download(app, tmp_path):
+    win, worker = make_window(tmp_path)
+    win.logged_in = True
+    worker.job_done.emit("chats", CHATS)
+    win.chat_list.setCurrentRow(0)
+    win.start()
+    worker.flood_wait.emit(26, "GetHistoryRequest")
+    assert "26" in win.current_label.text() and "قراءة رسائل" in win.current_label.text()
+    win.wait_until = 0
+    win._tick_wait()
+    assert win.current_label.text() == "" and not win.wait_timer.isActive()
     win.close()

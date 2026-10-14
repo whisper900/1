@@ -104,7 +104,7 @@ class TelegramWorker(QObject):
     qr = Signal(str)                    # tg://login URL to show as QR; "" = hide it
     notice = Signal(str)                # a line for the window's log
     chats_partial = Signal(list)        # chats loaded so far, while the list loads
-    flood_wait = Signal(int)            # Telegram asked us to wait this many seconds
+    flood_wait = Signal(int, str)       # seconds Telegram asked us to wait, request name
     job_done = Signal(str, object)      # job name, result
     job_failed = Signal(str, object)    # job name, exception
     event = Signal(str, dict)           # downloader event name, data
@@ -405,9 +405,10 @@ class _FloodWaitLog(logging.Handler):
         self.callback = callback
 
     def emit(self, record):
-        if "flood wait" in str(record.msg) and len(record.args or ()) >= 2:
+        args = record.args or ()
+        if "flood wait" in str(record.msg) and len(args) >= 4:
             try:
-                self.callback(int(record.args[1]))
+                self.callback(int(args[1]), str(args[3]))
             except (TypeError, ValueError):
                 pass
 

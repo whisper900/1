@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 APP_NAME = "TelegramDownloader"
@@ -50,6 +51,18 @@ def _chat_cache_path():
     return app_dir() / "chats.json"
 
 
+def chat_cache_age(account_id, path=None):
+    """Seconds since the saved chat list was refreshed (None if there is none)."""
+    path = Path(path) if path else _chat_cache_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("account") == account_id and data.get("saved_at"):
+            return max(0.0, time.time() - float(data["saved_at"]))
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return None
+
+
 def load_chat_cache(account_id, path=None):
     """Chat list saved by the last refresh for this account, or ``[]``."""
     path = Path(path) if path else _chat_cache_path()
@@ -71,7 +84,8 @@ def load_chat_cache(account_id, path=None):
 def save_chat_cache(account_id, chats, path=None):
     path = Path(path) if path else _chat_cache_path()
     tmp = path.with_suffix(".tmp")
-    data = {"account": account_id, "chats": [list(chat) for chat in chats]}
+    data = {"account": account_id, "saved_at": time.time(),
+            "chats": [list(chat) for chat in chats]}
     try:
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, path)
