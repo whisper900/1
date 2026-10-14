@@ -6,6 +6,9 @@
 # Downloaded files
 downloads/
 
+# Version stamp written by the release build
+tgdl/_build.py
+
 __pycache__/
 *.pyc
 .pytest_cache/

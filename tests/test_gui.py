@@ -39,6 +39,7 @@ def no_dialogs(monkeypatch):
 
 class FakeWorker(QObject):
     ask = Signal(str, dict)
+    qr = Signal(str)
     notice = Signal(str)
     job_done = Signal(str, object)
     job_failed = Signal(str, object)
@@ -314,3 +315,99 @@ def test_code_dialog_resend_and_submit(app):
     dialog.code_edit.setText(" 12345 ")
     dialog._accept_code()
     assert dialog.result_value == "12345"
+
+
+# -- QR login -------------------------------------------------------------------
+
+import datetime  # noqa: E402
+
+
+class FakeQR:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)   # exceptions to raise from wait(), in order
+        self.n = 0
+        self.expires = datetime.datetime.now(datetime.timezone.utc)
+
+    @property
+    def url(self):
+        return f"tg://login?token=t{self.n}"
+
+    async def wait(self, timeout=None):
+        if self.outcomes:
+            raise self.outcomes.pop(0)
+
+    async def recreate(self):
+        self.n += 1
+
+
+class QrClient(LoginClient):
+    def __init__(self, qr, authorized=False):
+        super().__init__(first=None)
+        self._qr = qr
+        self.authorized = authorized
+
+    async def qr_login(self):
+        return self._qr
+
+    def is_connected(self):
+        return True
+
+    async def is_user_authorized(self):
+        return self.authorized
+
+    async def get_me(self):
+        return type("Me", (), {"first_name": "Sara", "last_name": None, "id": 7,
+                               "phone": None, "username": None, "title": None})()
+
+
+def run_login(app, client, replies, method=None):
+    worker = TelegramWorker()
+    worker.client = client
+    worker._client_key = (1, "x", "s")
+    replies = iter(replies)
+    asked, urls = [], []
+    worker.ask.connect(lambda what, d: (asked.append(what), worker.answer(next(replies))))
+    worker.qr.connect(urls.append)
+    try:
+        name = wait_for(app, worker.submit("login", worker.login(1, "x", "s", method)))
+    finally:
+        worker.shutdown()
+    return name, asked, urls
+
+
+def test_qr_login_refreshes_expired_codes(app):
+    client = QrClient(FakeQR([asyncio.TimeoutError(), asyncio.TimeoutError()]))
+    name, asked, urls = run_login(app, client, ["qr"])
+    assert asked == ["method"]
+    assert urls == ["tg://login?token=t0", "tg://login?token=t1", "tg://login?token=t2", ""]
+    assert name == "Sara"
+
+
+def test_qr_login_with_two_step_password(app):
+    client = QrClient(FakeQR([errors.SessionPasswordNeededError(request=None)]))
+    name, asked, urls = run_login(app, client, ["qr", "secret"])
+    assert asked == ["method", "password"]
+    assert urls[-1] == ""                       # QR window closed before the password
+    assert client.signed_in_with == ["secret"]
+
+
+def test_existing_session_skips_login_questions(app):
+    name, asked, _ = run_login(app, QrClient(FakeQR([]), authorized=True), [])
+    assert asked == [] and name == "Sara"
+
+
+def test_qr_dialog_in_window(app, tmp_path):
+    win, worker = make_window(tmp_path)
+    win.login()
+    worker.qr.emit("tg://login?token=abc")
+    assert win.qr_dialog is not None
+    assert not win.qr_dialog.image.pixmap().isNull()
+    win.qr_dialog.reject()                      # user presses cancel
+    assert worker.future.cancelled
+    worker.job_failed.emit("login", asyncio.CancelledError())
+    assert "غير مسجّل" in win.account_label.text()
+    win.login()
+    worker.qr.emit("tg://login?token=new")
+    worker.qr.emit("")                          # scanned: window closes by itself
+    assert win.qr_dialog is None
+    win.close()

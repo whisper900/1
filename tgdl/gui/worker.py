@@ -5,6 +5,7 @@ submitted to the worker loop, and its outcome comes back as a Qt signal.
 """
 
 import asyncio
+import datetime
 import threading
 import time
 
@@ -99,6 +100,7 @@ def describe_next_type(sent):
 class TelegramWorker(QObject):
     # Emitted from the worker thread; Qt delivers them on the UI thread.
     ask = Signal(str, dict)             # what to ask, {"error", "info", "resend", ...}
+    qr = Signal(str)                    # tg://login URL to show as QR; "" = hide it
     notice = Signal(str)                # a line for the window's log
     job_done = Signal(str, object)      # job name, result
     job_failed = Signal(str, object)    # job name, exception
@@ -163,7 +165,7 @@ class TelegramWorker(QObject):
 
     # -- jobs (coroutines run on the worker loop) -------------------------
 
-    async def login(self, api_id, api_hash, session):
+    async def login(self, api_id, api_hash, session, method=None):
         key = (int(api_id), api_hash, str(session))
         if self.client is not None and self._client_key != key:
             await self.client.disconnect()
@@ -175,9 +177,42 @@ class TelegramWorker(QObject):
         if not self.client.is_connected():
             await self.client.connect()
         if not await self.client.is_user_authorized():
-            await self._interactive_login()
+            method = method or await self._ask("method")
+            if method == "qr":
+                await self._qr_login()
+            else:
+                await self._interactive_login()
         me = await self.client.get_me()
         return display_name(me) or (f"+{me.phone}" if me.phone else str(me.id))
+
+    async def _qr_login(self):
+        """Log in by scanning a QR code with the Telegram app (no SMS needed)."""
+        try:
+            qr = await self.client.qr_login()
+            while True:
+                self.qr.emit(qr.url)
+                now = datetime.datetime.now(datetime.timezone.utc)
+                timeout = max(5.0, (qr.expires - now).total_seconds())
+                try:
+                    await qr.wait(timeout)
+                    return
+                except asyncio.TimeoutError:
+                    await qr.recreate()   # codes expire after ~30 seconds
+                except errors.SessionPasswordNeededError:
+                    break
+        finally:
+            self.qr.emit("")
+        await self._password_login()
+
+    async def _password_login(self):
+        error = ""
+        while True:
+            password = await self._ask("password", error)
+            try:
+                await self.client.sign_in(password=password)
+                return
+            except errors.PasswordHashInvalidError:
+                error = "كلمة المرور غير صحيحة، حاول مرة أخرى."
 
     async def _interactive_login(self):
         client = self.client
@@ -226,14 +261,7 @@ class TelegramWorker(QObject):
                 sent = await self._send_code(phone)
                 error = "انتهت صلاحية الكود، أرسلنا لك كوداً جديداً."
 
-        error = ""
-        while True:
-            password = await self._ask("password", error)
-            try:
-                await client.sign_in(password=password)
-                return
-            except errors.PasswordHashInvalidError:
-                error = "كلمة المرور غير صحيحة، حاول مرة أخرى."
+        await self._password_login()
 
     async def _send_code(self, phone):
         request = functions.auth.SendCodeRequest(

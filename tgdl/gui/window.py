@@ -1,21 +1,26 @@
 """Main window of the desktop app (Arabic, right-to-left)."""
 
 import asyncio
+import io
 import re
+import sys
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
 from PySide6.QtCore import QDate, QStandardPaths, Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QIntValidator
+from PySide6.QtGui import QDesktopServices, QIntValidator, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
-    QProgressBar, QPushButton, QSpinBox, QSplitter, QVBoxLayout, QWidget)
+    QProgressBar, QProgressDialog, QPushButton, QSpinBox, QSplitter, QVBoxLayout,
+    QWidget)
 from telethon import errors as tg_errors
 
+from .. import __version__
 from ..downloader import Options
 from ..filters import MessageFilter, normalize_exts
+from . import updater
 from .config import Config, session_path
 from .worker import RESEND, LoginCancelled, TelegramWorker, friendly_error
 
@@ -189,6 +194,76 @@ class CodeDialog(QDialog):
         self.accept()
 
 
+class LoginMethodDialog(QDialog):
+    """QR code (no SMS needed) or phone number + code."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("تسجيل الدخول")
+        self.setMinimumWidth(440)
+        self.method = None
+        text = QLabel("اختر طريقة تسجيل الدخول إلى حسابك في تليكرام:")
+        qr_btn = QPushButton("بمسح رمز QR من هاتفك (موصى به، لا يحتاج كوداً)")
+        qr_btn.setDefault(True)
+        qr_btn.setStyleSheet("font-weight: bold; padding: 10px;")
+        qr_btn.clicked.connect(lambda: self._choose("qr"))
+        phone_btn = QPushButton("برقم الهاتف وكود الدخول")
+        phone_btn.setStyleSheet("padding: 8px;")
+        phone_btn.clicked.connect(lambda: self._choose("phone"))
+        cancel = QPushButton("إلغاء")
+        cancel.clicked.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addWidget(text)
+        layout.addWidget(qr_btn)
+        layout.addWidget(phone_btn)
+        layout.addWidget(cancel, alignment=Qt.AlignLeft)
+
+    def _choose(self, method):
+        self.method = method
+        self.accept()
+
+
+def qr_pixmap(url, scale=7):
+    import segno
+    buffer = io.BytesIO()
+    segno.make(url, error="m", micro=False).save(buffer, kind="png", scale=scale, border=3)
+    pixmap = QPixmap()
+    pixmap.loadFromData(buffer.getvalue(), "PNG")
+    return pixmap
+
+
+class QrDialog(QDialog):
+    """Shows the login QR code until the phone scans it (or the user cancels)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("تسجيل الدخول برمز QR")
+        self.setMinimumWidth(400)
+        self.image = QLabel(alignment=Qt.AlignCenter)
+        self.image.setMinimumSize(300, 300)
+        self.image.setStyleSheet("background: white;")
+        steps = QLabel(
+            "<ol>"
+            "<li>افتح تليكرام على هاتفك.</li>"
+            "<li>اذهب إلى <b>الإعدادات</b> ← <b>الأجهزة</b> ← "
+            "<b>ربط جهاز سطح المكتب</b> (Link Desktop Device).</li>"
+            "<li>وجّه كاميرا الهاتف نحو هذا الرمز.</li>"
+            "</ol>"
+            "يتجدد الرمز تلقائياً كل نصف دقيقة تقريباً، فلا مشكلة إن انتظرت.")
+        steps.setWordWrap(True)
+        steps.setTextFormat(Qt.RichText)
+        buttons = QDialogButtonBox()
+        buttons.addButton("إلغاء", QDialogButtonBox.RejectRole)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.image)
+        layout.addWidget(steps)
+        layout.addWidget(buttons)
+
+    def show_url(self, url):
+        self.image.setPixmap(qr_pixmap(url))
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config=None, worker=None, autostart=True):
         super().__init__()
@@ -198,8 +273,11 @@ class MainWindow(QMainWindow):
         self.job = None            # name of the running job
         self.job_future = None
         self.preview = False
+        self.qr_dialog = None
+        self.pending_update = None
+        self.updater = updater.Updater()
 
-        self.setWindowTitle(APP_TITLE)
+        self.setWindowTitle(f"{APP_TITLE} — الإصدار {__version__}")
         self.resize(1000, 720)
         self._build_ui()
         self._load_preferences()
@@ -210,6 +288,9 @@ class MainWindow(QMainWindow):
         self.worker.job_failed.connect(self._on_job_failed)
         self.worker.event.connect(self._on_download_event)
         self.worker.notice.connect(self.log)
+        self.worker.qr.connect(self._on_qr)
+        self.updater.checked.connect(self._on_update_checked)
+        self.updater.check_failed.connect(self._on_update_check_failed)
 
         self.stats_timer = QTimer(self, interval=300)
         self.stats_timer.timeout.connect(self._refresh_stats)
@@ -227,12 +308,15 @@ class MainWindow(QMainWindow):
         self.login_btn.clicked.connect(self.login)
         self.logout_btn = QPushButton("تسجيل الخروج")
         self.logout_btn.clicked.connect(self.logout)
+        self.update_btn = QPushButton("التحقق من التحديثات")
+        self.update_btn.clicked.connect(lambda: self.check_updates(manual=True))
         self.settings_btn = QPushButton("الإعدادات")
         self.settings_btn.clicked.connect(self.open_settings)
         account_bar = QHBoxLayout()
         account_bar.addWidget(self.account_label, 1)
         account_bar.addWidget(self.login_btn)
         account_bar.addWidget(self.logout_btn)
+        account_bar.addWidget(self.update_btn)
         account_bar.addWidget(self.settings_btn)
 
         # 1. Chats
@@ -443,6 +527,9 @@ class MainWindow(QMainWindow):
         self.job = None
         self.job_future = None
         self._update_state()
+        if self.pending_update is not None:
+            release, self.pending_update = self.pending_update, None
+            QTimer.singleShot(0, lambda: self._offer_update(release))
 
     def log(self, text):
         self.log_view.appendPlainText(text)
@@ -450,6 +537,9 @@ class MainWindow(QMainWindow):
     # -- login --------------------------------------------------------------
 
     def _first_start(self):
+        if updater.can_self_update():
+            updater.cleanup_old(sys.executable)
+            QTimer.singleShot(2000, self.check_updates)
         if not self.config.has_api:
             QMessageBox.information(
                 self, APP_TITLE,
@@ -478,12 +568,17 @@ class MainWindow(QMainWindow):
     def logout(self):
         answer = QMessageBox.question(
             self, "تسجيل الخروج",
-            "هل تريد تسجيل الخروج من الحساب؟\nستحتاج إلى الكود مرة أخرى للدخول.")
+            "هل تريد تسجيل الخروج من الحساب؟\nستحتاج إلى تسجيل الدخول مرة أخرى.")
         if answer == QMessageBox.Yes:
             self._run("logout", self.worker.logout())
 
     def _on_ask(self, what, details):
         error = details.get("error", "")
+        if what == "method":
+            dialog = LoginMethodDialog(self)
+            dialog.exec()
+            self.worker.answer(dialog.method)
+            return
         if what in CODE_TITLES:
             dialog = CodeDialog(CODE_TITLES[what], details.get("info", ""), error,
                                 details.get("resend"), self)
@@ -496,6 +591,103 @@ class MainWindow(QMainWindow):
         mode = QLineEdit.Password if what == "password" else QLineEdit.Normal
         value, ok = QInputDialog.getText(self, title, text, mode)
         self.worker.answer(value if ok else None)
+
+    def _on_qr(self, url):
+        if url:
+            if self.qr_dialog is None:
+                self.qr_dialog = QrDialog(self)
+                self.qr_dialog.rejected.connect(self._cancel_login)
+                self.qr_dialog.open()
+            self.qr_dialog.show_url(url)
+        elif self.qr_dialog is not None:
+            dialog, self.qr_dialog = self.qr_dialog, None
+            dialog.rejected.disconnect(self._cancel_login)
+            dialog.accept()
+
+    def _cancel_login(self):
+        self.qr_dialog = None
+        if self.job == "login" and self.job_future is not None:
+            self.job_future.cancel()
+
+    # -- updates --------------------------------------------------------------
+
+    def check_updates(self, manual=False):
+        if not updater.can_self_update():
+            if manual:
+                QMessageBox.information(self, "التحديثات",
+                                        "التحديث التلقائي يعمل في نسخة البرنامج (exe) فقط.")
+            return
+        if manual:
+            self.update_btn.setEnabled(False)
+        self.updater.check(manual)
+
+    def _on_update_checked(self, release, manual):
+        self.update_btn.setEnabled(True)
+        if release is None:
+            if manual:
+                QMessageBox.information(self, "التحديثات",
+                                        f"لديك أحدث إصدار ({__version__}).")
+            return
+        if self.job is not None:
+            self.pending_update = release   # ask when the current task ends
+            return
+        self._offer_update(release)
+
+    def _on_update_check_failed(self, message, manual):
+        self.update_btn.setEnabled(True)
+        if manual:
+            QMessageBox.warning(self, "التحديثات", message)
+
+    def _offer_update(self, release):
+        text = f"يتوفر إصدار جديد من البرنامج: {release.version}\n(الإصدار الحالي: {__version__})"
+        if release.notes:
+            text += f"\n\nالجديد في هذا الإصدار:\n{release.notes}"
+        text += "\n\nهل تريد التحديث الآن؟ سيُعاد تشغيل البرنامج تلقائياً."
+        box = QMessageBox(QMessageBox.Question, "تحديث جديد", text, parent=self)
+        now = box.addButton("تحديث الآن", QMessageBox.AcceptRole)
+        box.addButton("لاحقاً", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is now:
+            self._download_update(release)
+
+    def _download_update(self, release):
+        dialog = QProgressDialog("جارٍ تنزيل التحديث...", "إلغاء", 0, 100, self)
+        dialog.setWindowTitle("تحديث البرنامج")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.canceled.connect(self.updater.cancel)
+
+        def progress(done, total):
+            dialog.setValue(int(done * 100 / total) if total else 0)
+
+        def finished(path):
+            disconnect()
+            dialog.close()
+            try:
+                updater.install(path, sys.executable)
+                updater.restart(sys.executable)
+            except OSError as e:
+                QMessageBox.warning(self, "تحديث البرنامج",
+                                    f"تعذّر تثبيت التحديث: {e}\nحاول مرة أخرى لاحقاً.")
+                return
+            self.close()
+
+        def failed(message):
+            disconnect()
+            dialog.close()
+            if not dialog.wasCanceled():
+                QMessageBox.warning(self, "تحديث البرنامج", message)
+
+        def disconnect():
+            self.updater.progress.disconnect(progress)
+            self.updater.downloaded.disconnect(finished)
+            self.updater.download_failed.disconnect(failed)
+
+        self.updater.progress.connect(progress)
+        self.updater.downloaded.connect(finished)
+        self.updater.download_failed.connect(failed)
+        dialog.show()
+        self.updater.download(release)
 
     def load_chats(self):
         self.chat_list.clear()
@@ -668,7 +860,8 @@ class MainWindow(QMainWindow):
             return
         if name == "login":
             self.logged_in = False
-            if isinstance(exc, LoginCancelled):
+            self._on_qr("")
+            if isinstance(exc, (LoginCancelled, asyncio.CancelledError)):
                 self.account_label.setText("غير مسجّل الدخول")
                 return
             self.account_label.setText("لم يتم تسجيل الدخول")

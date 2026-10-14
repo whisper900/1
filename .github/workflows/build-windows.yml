@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write   # publish the release the app updates itself from
 
 jobs:
   windows:
@@ -27,6 +27,13 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: pytest -q
+
+      - name: Stamp version
+        shell: pwsh
+        run: |
+          $version = "1.0.${{ github.run_number }}"
+          Set-Content -Path tgdl/_build.py -Value "VERSION = `"$version`"" -Encoding utf8
+          "VERSION=$version" >> $env:GITHUB_ENV
 
       - name: Build TelegramDownloader.exe
         run: >
@@ -49,3 +56,22 @@ jobs:
           name: TelegramDownloader-windows
           path: dist/TelegramDownloader.exe
           if-no-files-found: error
+
+      - name: Publish release
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v$env:VERSION"
+          $exists = $false
+          try { gh release view $tag *> $null; $exists = ($LASTEXITCODE -eq 0) } catch { }
+          if ($exists) {
+            gh release upload $tag dist/TelegramDownloader.exe --clobber
+          } else {
+            gh release create $tag dist/TelegramDownloader.exe `
+              --target "${{ github.sha }}" `
+              --title "الإصدار $env:VERSION" `
+              --notes-file release-notes.md `
+              --latest
+          }
