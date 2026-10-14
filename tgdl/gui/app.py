@@ -55,6 +55,9 @@ def main(argv=None):
         return _selftest(app, MainWindow, Config, screenshot)
 
     window = MainWindow()
+    # Destroy the window (and its dialogs) while Qt is still running, not
+    # during Python's shutdown.
+    window.setAttribute(Qt.WA_DeleteOnClose)
     window.show()
     return app.exec()
 

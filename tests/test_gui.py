@@ -28,6 +28,21 @@ def app():
 
 
 @pytest.fixture(autouse=True)
+def delete_windows(app, no_dialogs):
+    """Destroy every window a test made while QApplication still exists.
+
+    Depends on no_dialogs so closing a busy window cannot open a real
+    (blocking) question box.
+    """
+    yield
+    from PySide6.QtCore import QCoreApplication, QEvent
+    for widget in QApplication.topLevelWidgets():
+        widget.close()
+        widget.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+
+@pytest.fixture(autouse=True)
 def no_dialogs(monkeypatch):
     """Message boxes would block the test; record them instead."""
     shown = []

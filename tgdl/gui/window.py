@@ -53,6 +53,13 @@ ASK_TEXT = {
 CODE_TITLES = {"code": "كود الدخول", "email_code": "كود تأكيد البريد"}
 
 
+def _dispose(widget):
+    """Free a finished dialog now rather than when its parent window dies."""
+    if isinstance(widget, QWidget):
+        widget.setParent(None)
+        widget.deleteLater()
+
+
 def size_ar(num):
     """File size with Arabic units (Latin units get scrambled in RTL text)."""
     if num is None:
@@ -185,11 +192,13 @@ class SelectFilesDialog(QDialog):
             self.tree.addTopLevelItem(row)
         self.tree.setSortingEnabled(True)
         self.tree.sortByColumn(4, Qt.AscendingOrder)       # oldest first, like the chat
+        # Fit the columns once; a live ResizeToContents mode keeps measuring
+        # rows and has crashed while Qt tears the dialog down.
         header = self.tree.header()
+        for column in range(1, len(self.COLUMNS)):
+            self.tree.resizeColumnToContents(column)
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.Stretch)
-        for column in range(1, len(self.COLUMNS)):
-            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self.tree.itemChanged.connect(self._update_summary)
         self.tree.itemDoubleClicked.connect(self._toggle)
 
@@ -688,10 +697,11 @@ class MainWindow(QMainWindow):
     def open_settings(self, tab=TAB_FILES, require_api=False):
         dialog = SettingsDialog(self.config, self, tab=tab, require_api=require_api,
                                 on_check_updates=lambda: self.check_updates(manual=True))
-        if dialog.exec() == QDialog.Accepted:
+        accepted = dialog.exec() == QDialog.Accepted
+        _dispose(dialog)
+        if accepted:
             self._refresh_summary()
-            return True
-        return False
+        return accepted
 
     def login(self):
         if not self.config.has_api:
@@ -713,13 +723,17 @@ class MainWindow(QMainWindow):
         if what == "method":
             dialog = LoginMethodDialog(self)
             dialog.exec()
-            self.worker.answer(dialog.method)
+            method = dialog.method
+            _dispose(dialog)
+            self.worker.answer(method)
             return
         if what in CODE_TITLES:
             dialog = CodeDialog(CODE_TITLES[what], details.get("info", ""), error,
                                 details.get("resend"), self)
             accepted = dialog.exec() == QDialog.Accepted
-            self.worker.answer(dialog.result_value if accepted else None)
+            value = dialog.result_value if accepted else None
+            _dispose(dialog)
+            self.worker.answer(value)
             return
         title, text = ASK_TEXT[what]
         if error:
@@ -739,8 +753,11 @@ class MainWindow(QMainWindow):
             dialog, self.qr_dialog = self.qr_dialog, None
             dialog.rejected.disconnect(self._cancel_login)
             dialog.accept()
+            dialog.deleteLater()
 
     def _cancel_login(self):
+        if self.qr_dialog is not None:
+            self.qr_dialog.deleteLater()
         self.qr_dialog = None
         if self.job == "login" and self.job_future is not None:
             self.job_future.cancel()
@@ -783,7 +800,9 @@ class MainWindow(QMainWindow):
         now = box.addButton("تحديث الآن", QMessageBox.AcceptRole)
         box.addButton("لاحقاً", QMessageBox.RejectRole)
         box.exec()
-        if box.clickedButton() is now:
+        clicked = box.clickedButton()
+        _dispose(box)
+        if clicked is now:
             self._download_update(release)
 
     def _download_update(self, release):
@@ -982,8 +1001,11 @@ class MainWindow(QMainWindow):
             return
         self.current_label.setText(f"وُجد {len(items)} ملف. اختر ما تريد تنزيله.")
         dialog = SelectFilesDialog(items, stats.skipped, self)
-        if dialog.exec() == QDialog.Accepted and dialog.selected_ids():
-            self.start(ids=dialog.selected_ids(), chat=self.pick_chat)
+        accepted = dialog.exec() == QDialog.Accepted
+        ids = dialog.selected_ids() if accepted else []
+        _dispose(dialog)
+        if ids:
+            self.start(ids=ids, chat=self.pick_chat)
 
     def stop(self):
         if self.job_future is not None:
@@ -1133,7 +1155,9 @@ class MainWindow(QMainWindow):
         open_btn = box.addButton("فتح المجلد", QMessageBox.AcceptRole)
         box.addButton("إغلاق", QMessageBox.RejectRole)
         box.exec()
-        if box.clickedButton() is open_btn:
+        clicked = box.clickedButton()
+        _dispose(box)
+        if clicked is open_btn:
             self.open_out_dir()
 
     # -- closing --------------------------------------------------------------
