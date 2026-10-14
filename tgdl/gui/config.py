@@ -59,7 +59,13 @@ def load_chat_cache(account_id, path=None):
         return []
     if not isinstance(data, dict) or data.get("account") != account_id:
         return []
-    return [tuple(chat) for chat in data.get("chats", []) if len(chat) == 3]
+    chats = []
+    for chat in data.get("chats", []):
+        if len(chat) == 3:          # saved by version 1.0.5
+            chat = [*chat, ""]
+        if len(chat) == 4:
+            chats.append(tuple(chat))
+    return chats
 
 
 def save_chat_cache(account_id, chats, path=None):

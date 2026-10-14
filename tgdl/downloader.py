@@ -107,7 +107,9 @@ class Downloader:
                 if self.opts.dry_run:
                     self.log(f"[{msg.id}] would download {rel} "
                              f"({human_size(msg.file.size)})")
-                    self._emit("planned", msg_id=msg.id, path=rel, size=msg.file.size)
+                    self._emit("planned", msg_id=msg.id, path=rel, size=msg.file.size,
+                               kind=kind, date=msg.date, file_name=msg.file.name,
+                               sender=sender_fields(sender)["sender"])
                     self.stats.bytes += msg.file.size or 0
                     if self.opts.limit and self.stats.queued >= self.opts.limit:
                         break

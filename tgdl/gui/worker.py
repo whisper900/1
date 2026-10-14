@@ -324,33 +324,55 @@ class TelegramWorker(QObject):
                 error = friendly_error(e)
 
     async def load_chats(self):
-        """All chats, newest first; partial lists are emitted every 100 chats."""
+        """Chats in Telegram's own order: the main list (pinned first, then by
+        latest message), then the archived chats.
+
+        Each chat is ``(id, name, kind, mark)`` where mark is "pinned",
+        "archived" or "". Partial lists are emitted every 100 chats.
+        """
         chats, entities = [], {}
-        async for dialog in self.client.iter_dialogs():
-            entity = dialog.entity
-            if getattr(entity, "is_self", False):
-                name, kind = "الرسائل المحفوظة", "saved"
-            else:
-                name = dialog.name or str(dialog.id)
-                kind = ("user" if dialog.is_user else
-                        "channel" if dialog.is_channel and not dialog.is_group else
-                        "group")
-            entities[dialog.id] = (entity, name)
-            chats.append((dialog.id, name, kind))
-            if len(chats) % 100 == 0:
-                self.chats_partial.emit(list(chats))
+        for folder in (0, 1):            # 0 = main list, 1 = archive
+            async for dialog in self.client.iter_dialogs(folder=folder):
+                entity = dialog.entity
+                if getattr(entity, "is_self", False):
+                    name, kind = "الرسائل المحفوظة", "saved"
+                else:
+                    name = dialog.name or str(dialog.id)
+                    kind = ("user" if dialog.is_user else
+                            "channel" if dialog.is_channel and not dialog.is_group else
+                            "group")
+                mark = "archived" if folder == 1 else "pinned" if dialog.pinned else ""
+                entities[dialog.id] = (entity, name)
+                chats.append((dialog.id, name, kind, mark))
+                if len(chats) % 100 == 0:
+                    self.chats_partial.emit(list(chats))
         self.chats = entities
         return chats
 
-    async def download(self, chat_id, options, name=None):
-        if chat_id in self.chats:
-            entity, name = self.chats[chat_id]
-        else:
+    async def _resolve_chat(self, chat_id, name=None):
+        if chat_id not in self.chats:
             # Picked from the saved list before the refresh finished: the
             # session file already knows this chat, so this is one request.
             entity = await self.client.get_entity(chat_id)
-            name = name or display_name(entity) or str(chat_id)
-            self.chats[chat_id] = (entity, name)
+            self.chats[chat_id] = (entity, name or display_name(entity) or str(chat_id))
+        return self.chats[chat_id]
+
+    async def scan(self, chat_id, options, name=None):
+        """Files that a download would fetch, for the user to pick from."""
+        entity, name = await self._resolve_chat(chat_id, name)
+        items = []
+
+        def on_event(event, **data):
+            if event == "planned":
+                items.append(data)
+            else:
+                self._on_event(event, **data)
+        self.downloader = Downloader(self.client, entity, options, chat_name=name,
+                                     log=lambda _line: None, on_event=on_event)
+        return items, await self.downloader.run()
+
+    async def download(self, chat_id, options, name=None):
+        entity, name = await self._resolve_chat(chat_id, name)
         self.downloader = Downloader(self.client, entity, options, chat_name=name,
                                      log=lambda _line: None, on_event=self._on_event)
         return await self.downloader.run()

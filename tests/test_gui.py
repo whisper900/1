@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from pathlib import Path
 
 import pytest
 
@@ -104,7 +105,7 @@ def test_login_then_choose_chat_then_download(app, tmp_path, no_dialogs):
     assert "Ahmed Ali" in win.account_label.text()
     assert worker.submitted[-1] == "chats"
 
-    worker.job_done.emit("chats", [(-100123, "العائلة", "group"), (42, "Sara", "user")])
+    worker.job_done.emit("chats", [(-100123, "العائلة", "group", ""), (42, "Sara", "user", "")])
     assert win.chat_list.count() == 2
     win.chat_list.setCurrentRow(0)
     assert win.start_btn.isEnabled()
@@ -149,7 +150,7 @@ def test_login_then_choose_chat_then_download(app, tmp_path, no_dialogs):
 def test_preview_and_validation(app, tmp_path, no_dialogs):
     win, worker = make_window(tmp_path)
     win.logged_in = True
-    worker.job_done.emit("chats", [(1, "Work", "group")])
+    worker.job_done.emit("chats", [(1, "Work", "group", "")])
     win.chat_list.setCurrentRow(0)
 
     for box in win.type_checks.values():
@@ -426,7 +427,8 @@ def test_qr_dialog_in_window(app, tmp_path):
 
 from tgdl.gui.config import load_chat_cache, save_chat_cache  # noqa: E402
 
-CHATS = [(-1001, "العائلة", "group"), (42, "Sara", "user"), (7, "Work", "group")]
+CHATS = [(-1001, "العائلة", "group", "pinned"), (42, "Sara", "user", ""),
+         (7, "Work", "group", "archived")]
 
 
 def test_saved_chats_show_at_once_and_refresh_in_background(app, tmp_path):
@@ -502,3 +504,104 @@ def test_download_from_saved_list_resolves_chat(app, tmp_path):
         assert stats.scanned == 0 and worker.chats[-1005][1] == "القناة"
     finally:
         worker.shutdown()
+
+
+# -- Telegram's chat order and picking individual files -------------------------
+
+def test_chats_come_in_telegram_order(app):
+    from types import SimpleNamespace as NS
+
+    def dialog(did, name, pinned=False):
+        return NS(id=did, name=name, pinned=pinned, entity=NS(id=did), is_user=True,
+                  is_channel=False, is_group=False)
+
+    class DialogClient:
+        async def iter_dialogs(self, folder=None):
+            folders = {0: [dialog(1, "Pinned", True), dialog(2, "Recent"), dialog(3, "Older")],
+                       1: [dialog(4, "Archived")]}
+            for d in folders[folder]:
+                yield d
+
+    worker = TelegramWorker()
+    worker.client = DialogClient()
+    try:
+        chats = wait_for(app, worker.submit("chats", worker.load_chats()))
+    finally:
+        worker.shutdown()
+    assert chats == [(1, "Pinned", "user", "pinned"), (2, "Recent", "user", ""),
+                     (3, "Older", "user", ""), (4, "Archived", "user", "archived")]
+
+
+def test_chat_marks_shown_and_old_cache_format_read(app, tmp_path):
+    import json
+    path = tmp_path / "c.json"
+    path.write_text(json.dumps({"account": 1, "chats": [[5, "Old", "user"]]}))
+    assert load_chat_cache(1, path) == [(5, "Old", "user", "")]
+
+    win, worker = make_window(tmp_path)
+    win.logged_in = True
+    worker.job_done.emit("chats", CHATS)
+    texts = [win.chat_list.item(i).text() for i in range(win.chat_list.count())]
+    assert texts[0].startswith("📌 العائلة")
+    assert "مؤرشفة" in texts[2] and texts[2].startswith("Work")
+    win.close()
+
+
+def picked(n, kind="document", name=None, sender="Ahmed", size=1000):
+    import datetime as dt
+    return {"msg_id": n, "path": Path(f"c/{sender}/{n}.pdf"), "size": size, "kind": kind,
+            "date": dt.datetime(2025, 1, n, tzinfo=dt.timezone.utc),
+            "file_name": name, "sender": sender}
+
+
+def test_select_files_dialog(app):
+    items = [picked(3, name="c.pdf"), picked(1, name="a.pdf", sender="Sara"),
+             picked(2, kind="photo", size=5000)]
+    dialog = window_mod.SelectFilesDialog(items, already=4)
+    rows = dialog._rows()
+    assert [r.data(0, window_mod.ID_ROLE) for r in rows] == [1, 2, 3]   # oldest first
+    assert not dialog.ok_btn.isEnabled()
+
+    dialog.search.setText("sara")
+    dialog._set_visible(window_mod.Qt.Checked)       # "select all" ticks visible rows only
+    assert dialog.selected_ids() == [1]
+    dialog.search.setText("")
+    dialog._toggle(rows[1], 0)                        # double-click the photo
+    assert dialog.selected_ids() == [1, 2]
+    assert "2" in dialog.ok_btn.text() and dialog.ok_btn.isEnabled()
+    dialog._set_visible(window_mod.Qt.Unchecked)
+    assert dialog.selected_ids() == []
+
+
+def test_pick_files_then_download_only_those(app, tmp_path, monkeypatch, no_dialogs):
+    win, worker = make_window(tmp_path)
+    win.logged_in = True
+    worker.job_done.emit("chats", CHATS)
+    win.chat_list.setCurrentRow(1)
+    scans = []
+    worker.scan = lambda chat_id, options, name: scans.append((chat_id, options)) or worker._noop()
+
+    class Picker:
+        def __init__(self, items, already, parent):
+            self.items = items
+
+        def exec(self):
+            return window_mod.QDialog.Accepted
+
+        def selected_ids(self):
+            return [self.items[0]["msg_id"]]
+    monkeypatch.setattr(window_mod, "SelectFilesDialog", Picker)
+
+    win.pick_files()
+    assert worker.submitted[-1] == "scan" and scans[0][1].dry_run
+    assert win.stop_btn.isEnabled()
+    worker.job_done.emit("scan", ([picked(9)], Stats(queued=1)))
+    _, chat_id, opts = worker.calls[-1]
+    assert worker.submitted[-1] == "download"
+    assert chat_id == 42 and opts.ids == [9] and not opts.dry_run
+
+    win._job_finished()
+    win.pick_files()
+    worker.job_done.emit("scan", ([], Stats(skipped=3)))
+    assert any("لا توجد ملفات جديدة" in text for _, text in no_dialogs)
+    win.close()

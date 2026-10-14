@@ -13,8 +13,8 @@ from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
-    QProgressBar, QProgressDialog, QPushButton, QSpinBox, QSplitter, QVBoxLayout,
-    QWidget)
+    QProgressBar, QProgressDialog, QPushButton, QSpinBox, QSplitter, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget)
 from telethon import errors as tg_errors
 
 from .. import __version__
@@ -195,6 +195,139 @@ class CodeDialog(QDialog):
         self.accept()
 
 
+KIND_LABELS = {
+    "photo": "صورة", "video": "فيديو", "document": "ملف", "audio": "صوت",
+    "voice": "رسالة صوتية", "video_note": "فيديو دائري", "gif": "GIF", "sticker": "ملصق",
+}
+SORT_ROLE = Qt.UserRole
+ID_ROLE = Qt.UserRole + 1
+SEARCH_ROLE = Qt.UserRole + 2
+
+
+class _FileRow(QTreeWidgetItem):
+    """Sorts by the raw value (bytes, timestamp) rather than the shown text."""
+
+    def __lt__(self, other):
+        column = self.treeWidget().sortColumn() if self.treeWidget() else 0
+        mine, theirs = self.data(column, SORT_ROLE), other.data(column, SORT_ROLE)
+        if mine is not None and theirs is not None:
+            return mine < theirs
+        return self.text(column) < other.text(column)
+
+
+class SelectFilesDialog(QDialog):
+    """Lists the files a download would fetch; the user ticks the ones wanted."""
+
+    COLUMNS = ["الملف", "المرسل", "النوع", "الحجم", "التاريخ"]
+
+    def __init__(self, items, already=0, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("اختر الملفات المطلوب تنزيلها")
+        self.resize(860, 580)
+
+        intro = f"وُجد {len(items)} ملف جديد في هذه المحادثة حسب اختياراتك. ضع علامة ✔ على ما تريد تنزيله."
+        if already:
+            intro += f"\n({already} ملف منزّل مسبقاً لا يظهر هنا.)"
+        intro_label = QLabel(intro)
+        intro_label.setWordWrap(True)
+
+        self.search = QLineEdit(placeholderText="ابحث باسم الملف أو المرسل أو النوع...")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self._filter)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(self.COLUMNS)
+        self.tree.setRootIsDecorated(False)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setAlternatingRowColors(True)
+        for i, item in enumerate(items):
+            name = item.get("file_name") or Path(item["path"]).name
+            kind = KIND_LABELS.get(item.get("kind"), item.get("kind") or "")
+            date = item.get("date")
+            row = _FileRow([
+                f"\u2068{name}\u2069",
+                f"\u2068{item.get('sender') or ''}\u2069",
+                kind,
+                size_ar(item.get("size")),
+                f"{date:%Y/%m/%d %H:%M}" if date else "",
+            ])
+            row.setFlags(row.flags() | Qt.ItemIsUserCheckable)
+            row.setCheckState(0, Qt.Unchecked)
+            row.setData(0, ID_ROLE, item["msg_id"])
+            row.setData(0, SEARCH_ROLE, f"{name} {item.get('sender') or ''} {kind}".casefold())
+            row.setData(0, SORT_ROLE, name.casefold())
+            row.setData(1, SORT_ROLE, (item.get("sender") or "").casefold())
+            row.setData(2, SORT_ROLE, kind)
+            row.setData(3, SORT_ROLE, item.get("size") or 0)
+            row.setData(4, SORT_ROLE, date.timestamp() if date else 0.0)
+            self.tree.addTopLevelItem(row)
+        self.tree.setSortingEnabled(True)
+        self.tree.sortByColumn(4, Qt.AscendingOrder)       # oldest first, like the chat
+        self.tree.header().resizeSection(0, 330)
+        self.tree.itemChanged.connect(self._update_summary)
+        self.tree.itemDoubleClicked.connect(self._toggle)
+
+        select_all = QPushButton("تحديد الكل")
+        select_all.clicked.connect(lambda: self._set_visible(Qt.Checked))
+        select_none = QPushButton("إلغاء التحديد")
+        select_none.clicked.connect(lambda: self._set_visible(Qt.Unchecked))
+        self.summary = QLabel()
+        tools = QHBoxLayout()
+        tools.addWidget(select_all)
+        tools.addWidget(select_none)
+        tools.addStretch(1)
+        tools.addWidget(self.summary)
+
+        buttons = QDialogButtonBox()
+        self.ok_btn = buttons.addButton("تنزيل المحدد", QDialogButtonBox.AcceptRole)
+        self.ok_btn.setDefault(True)
+        buttons.addButton("إلغاء", QDialogButtonBox.RejectRole)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(intro_label)
+        layout.addWidget(self.search)
+        layout.addWidget(self.tree, 1)
+        layout.addLayout(tools)
+        layout.addWidget(buttons)
+        self._update_summary()
+
+    def _rows(self):
+        return [self.tree.topLevelItem(i) for i in range(self.tree.topLevelItemCount())]
+
+    def _filter(self, text):
+        needle = text.strip().casefold()
+        for row in self._rows():
+            row.setHidden(bool(needle) and needle not in row.data(0, SEARCH_ROLE))
+
+    def _set_visible(self, state):
+        self.tree.blockSignals(True)         # one summary update, not one per row
+        for row in self._rows():
+            if not row.isHidden():
+                row.setCheckState(0, state)
+        self.tree.blockSignals(False)
+        self._update_summary()
+
+    def _toggle(self, row, _column):
+        checked = row.checkState(0) == Qt.Checked
+        row.setCheckState(0, Qt.Unchecked if checked else Qt.Checked)
+
+    def _update_summary(self, *_):
+        count = total = 0
+        for row in self._rows():
+            if row.checkState(0) == Qt.Checked:
+                count += 1
+                total += row.data(3, SORT_ROLE) or 0
+        self.summary.setText(f"المحدد: {count} ملف ({size_ar(total)})")
+        self.ok_btn.setText(f"تنزيل المحدد ({count})")
+        self.ok_btn.setEnabled(count > 0)
+
+    def selected_ids(self):
+        return sorted(row.data(0, ID_ROLE) for row in self._rows()
+                      if row.checkState(0) == Qt.Checked)
+
+
 class LoginMethodDialog(QDialog):
     """QR code (no SMS needed) or phone number + code."""
 
@@ -274,6 +407,8 @@ class MainWindow(QMainWindow):
         self.job = None            # name of the running job
         self.job_future = None
         self.preview = False
+        self.mode = None             # "download", "preview" or "scan"
+        self.pick_chat = None
         self.qr_dialog = None
         self.pending_update = None
         self.chats_future = None     # chat list refresh runs beside other jobs
@@ -439,6 +574,9 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 3)
 
         # Actions and progress
+        self.pick_btn = QPushButton("اختيار ملفات محددة...")
+        self.pick_btn.setToolTip("يعرض قائمة الملفات في المحادثة لتختار منها ما تريد تنزيله فقط")
+        self.pick_btn.clicked.connect(self.pick_files)
         self.preview_btn = QPushButton("معاينة (بدون تنزيل)")
         self.preview_btn.clicked.connect(lambda: self.start(preview=True))
         self.start_btn = QPushButton("ابدأ التنزيل")
@@ -451,6 +589,7 @@ class MainWindow(QMainWindow):
         self.open_btn.clicked.connect(self.open_out_dir)
         actions = QHBoxLayout()
         actions.addWidget(self.start_btn)
+        actions.addWidget(self.pick_btn)
         actions.addWidget(self.preview_btn)
         actions.addWidget(self.stop_btn)
         actions.addStretch(1)
@@ -531,7 +670,7 @@ class MainWindow(QMainWindow):
 
     def _update_state(self):
         busy = self.job is not None
-        downloading = self.job in ("download", "preview")
+        downloading = self.job in ("download", "preview", "scan")
         has_chat = self.chat_list.currentItem() is not None
         self.login_btn.setVisible(not self.logged_in)
         self.login_btn.setEnabled(not busy)
@@ -544,6 +683,7 @@ class MainWindow(QMainWindow):
         ready = self.logged_in and has_chat and not busy
         self.start_btn.setEnabled(ready)
         self.preview_btn.setEnabled(ready)
+        self.pick_btn.setEnabled(ready)
         self.stop_btn.setEnabled(downloading)
 
     def _run(self, name, coro):
@@ -735,8 +875,12 @@ class MainWindow(QMainWindow):
         current = self.chat_list.currentItem()
         selected = current.data(Qt.UserRole) if current else None
         self.chat_list.clear()
-        for chat_id, title, kind in chats:
-            item = QListWidgetItem(f"{title}    ({CHAT_KINDS.get(kind, kind)})")
+        for chat_id, title, kind, mark in chats:
+            label = CHAT_KINDS.get(kind, kind)
+            if mark == "archived":
+                label += "، مؤرشفة"
+            pin = "📌 " if mark == "pinned" else ""
+            item = QListWidgetItem(f"{pin}{title}    ({label})")
             item.setData(Qt.UserRole, chat_id)
             item.setData(Qt.UserRole + 1, title)
             self.chat_list.addItem(item)
@@ -824,25 +968,66 @@ class MainWindow(QMainWindow):
             naming=self.naming_combo.currentData(),
         )
 
-    def start(self, preview=False):
+    def _current_chat(self):
         item = self.chat_list.currentItem()
         chat_id = item.data(Qt.UserRole) if item else None
-        if chat_id is None:
+        return (chat_id, item.data(Qt.UserRole + 1)) if chat_id is not None else None
+
+    def _begin(self, job, message, coro_factory, preview):
+        self._save_preferences()
+        self.preview = preview
+        self.mode = job
+        self.log_view.clear()
+        self.progress.setValue(0)
+        self.current_label.setText(" ")
+        self.log(message)
+        self.worker.downloader = None
+        self._run(job, coro_factory())
+        self.stats_timer.start()
+
+    def start(self, preview=False, ids=None, chat=None):
+        chat = chat or self._current_chat()
+        if chat is None:
             return
         options = self._collect_options(preview)
         if options is None:
             return
-        self._save_preferences()
-        self.preview = preview
-        self.log_view.clear()
-        self.progress.setValue(0)
-        self.current_label.setText(" ")
-        verb = "معاينة" if preview else "تنزيل"
-        self.log(f"بدء {verb} الملفات من: {item.data(Qt.UserRole + 1)}")
-        self.worker.downloader = None
-        self._run("preview" if preview else "download",
-                  self.worker.download(chat_id, options, item.data(Qt.UserRole + 1)))
-        self.stats_timer.start()
+        options.ids = ids
+        chat_id, name = chat
+        if ids:
+            message = f"بدء تنزيل {len(ids)} ملف محدد من: {name}"
+        else:
+            message = f"بدء {'معاينة' if preview else 'تنزيل'} الملفات من: {name}"
+        self._begin("preview" if preview else "download", message,
+                    lambda: self.worker.download(chat_id, options, name), preview)
+
+    def pick_files(self):
+        """Find the matching files, then let the user tick the ones to download."""
+        chat = self._current_chat()
+        if chat is None:
+            return
+        options = self._collect_options(preview=True)
+        if options is None:
+            return
+        self.pick_chat = chat
+        self._begin("scan", f"جارٍ البحث عن الملفات في: {chat[1]}",
+                    lambda: self.worker.scan(chat[0], options, chat[1]), True)
+
+    def _show_picker(self, result):
+        self.stats_timer.stop()
+        self._refresh_stats()
+        items, stats = result
+        if not items:
+            msg = "لا توجد ملفات جديدة مطابقة للاختيارات في هذه المحادثة."
+            if stats.skipped:
+                msg += f"\n{stats.skipped} ملف منزّل مسبقاً."
+            self.current_label.setText(msg.replace("\n", " "))
+            QMessageBox.information(self, "اختيار الملفات", msg)
+            return
+        self.current_label.setText(f"وُجد {len(items)} ملف. اختر ما تريد تنزيله.")
+        dialog = SelectFilesDialog(items, stats.skipped, self)
+        if dialog.exec() == QDialog.Accepted and dialog.selected_ids():
+            self.start(ids=dialog.selected_ids(), chat=self.pick_chat)
 
     def stop(self):
         if self.job_future is not None:
@@ -863,7 +1048,9 @@ class MainWindow(QMainWindow):
         if dl is None:
             return
         s = dl.stats
-        if self.preview:
+        if self.mode == "scan":
+            text = f"تم فحص {s.scanned} رسالة — وُجد {s.queued} ملف جديد"
+        elif self.preview:
             text = (f"تم فحص {s.scanned} رسالة — سيتم تنزيل {s.queued} ملف "
                     f"({size_ar(s.bytes)}) — موجود مسبقاً {s.skipped}")
         else:
@@ -916,6 +1103,8 @@ class MainWindow(QMainWindow):
             self.load_chats()
         elif name in ("download", "preview"):
             self._finish_download(result)
+        elif name == "scan":
+            self._show_picker(result)
         elif name == "logout":
             self.logged_in = False
             clear_chat_cache(self.chat_cache_path)
@@ -935,7 +1124,7 @@ class MainWindow(QMainWindow):
             self.logged_in = False
             self.account_label.setText("انتهت جلسة الدخول، سجّل الدخول من جديد")
             self._update_state()
-        if name in ("download", "preview"):
+        if name in ("download", "preview", "scan"):
             self.stats_timer.stop()
             self._refresh_stats()
             if isinstance(exc, asyncio.CancelledError):
@@ -991,7 +1180,7 @@ class MainWindow(QMainWindow):
     # -- closing --------------------------------------------------------------
 
     def closeEvent(self, event):
-        if self.job in ("download", "preview"):
+        if self.job in ("download", "preview", "scan"):
             answer = QMessageBox.question(self, APP_TITLE,
                                           "التنزيل ما زال يعمل. هل تريد إيقافه والخروج؟")
             if answer != QMessageBox.Yes:

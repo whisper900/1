@@ -236,3 +236,15 @@ def test_numbered_dry_run_shows_names_without_writing(tmp_path):
     _, logs = run(client, tmp_path, naming="numbers", dry_run=True)
     assert "1.pdf" in logs[0] and "2.pdf" in logs[1]
     assert not any(tmp_path.iterdir())
+
+
+def test_planned_event_describes_the_file(tmp_path):
+    events = []
+    client = FakeClient([FakeMsg(1, AHMED, name="cv.pdf", date=day(3))])
+    dl = Downloader(client, CHAT, Options(out_dir=tmp_path, dry_run=True),
+                    log=lambda _: None, on_event=lambda name, **d: events.append((name, d)))
+    asyncio.run(dl.run())
+    (name, data), = events
+    assert name == "planned"
+    assert data["file_name"] == "cv.pdf" and data["sender"] == "Ahmed Ali"
+    assert data["kind"] == "document" and data["date"] == day(3) and data["msg_id"] == 1
