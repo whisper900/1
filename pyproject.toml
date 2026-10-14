@@ -12,13 +12,17 @@ dependencies = ["telethon>=1.36"]
 
 [project.optional-dependencies]
 fast = ["cryptg"]
+gui = ["PySide6-Essentials>=6.5"]
 test = ["pytest"]
 
 [project.scripts]
 tgdl = "tgdl.cli:main"
 
+[project.gui-scripts]
+tgdl-gui = "tgdl.gui.app:main"
+
 [tool.setuptools]
-packages = ["tgdl"]
+packages = ["tgdl", "tgdl.gui"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

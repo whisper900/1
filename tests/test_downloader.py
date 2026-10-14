@@ -164,3 +164,30 @@ def test_cancel_stops_running_downloads_and_cleans_up(tmp_path):
             pass
     asyncio.run(main())
     assert files(tmp_path) == []
+
+
+def test_events_for_graphical_front_ends(tmp_path):
+    events = []
+
+    class ProgressClient(FakeClient):
+        async def download_media(self, msg, file=None, progress_callback=None):
+            progress_callback(2, 4)
+            return await super().download_media(msg, file)
+
+    client = ProgressClient(
+        [FakeMsg(1, AHMED, name="a.pdf"), FakeMsg(2, AHMED, kind="photo", ext=".jpg")],
+        fail={1: [ConnectionError("blip")]})
+    dl = Downloader(client, CHAT, Options(out_dir=tmp_path, parallel=1,
+                                          type_names={"photo": "صور"},
+                                          folder="{sender}/{type}"),
+                    log=lambda _: None, on_event=lambda name, **d: events.append((name, d)))
+
+    async def no_sleep(_):
+        pass
+    dl._sleep = no_sleep
+    stats = asyncio.run(dl.run())
+    names = [name for name, _ in events]
+    assert names.count("saved") == 2 and "retry" in names and "progress" in names
+    assert stats.scanned == 2
+    assert files(tmp_path) == ["Ahmed Ali/document/a.pdf",
+                               "Ahmed Ali/صور/photo_2025-01-01_12-00-00_2.jpg"]

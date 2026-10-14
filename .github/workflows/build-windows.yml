@@ -1,0 +1,51 @@
+name: Build Windows app
+
+on:
+  push:
+    branches: ["main", "claude/telegram-file-downloader-aiwv03"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-gui.txt pyinstaller pytest
+
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest -q
+
+      - name: Build TelegramDownloader.exe
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name TelegramDownloader
+          --icon assets/icon.ico
+          --add-data "assets/icon.png;assets"
+          --hidden-import cryptg
+          TelegramDownloader.py
+
+      - name: Check that the exe starts
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\TelegramDownloader.exe -ArgumentList "--selftest" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "self-test failed with exit code $($p.ExitCode)" }
+          "{0:N1} MB" -f ((Get-Item dist\TelegramDownloader.exe).Length / 1MB)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TelegramDownloader-windows
+          path: dist/TelegramDownloader.exe
+          if-no-files-found: error

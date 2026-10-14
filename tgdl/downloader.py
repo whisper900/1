@@ -31,10 +31,12 @@ class Options:
     parallel: int = 3
     dry_run: bool = False
     retries: int = 3
+    type_names: dict = field(default_factory=dict)  # kind -> {type} folder name
 
 
 @dataclass
 class Stats:
+    scanned: int = 0          # messages looked at
     matched: int = 0
     queued: int = 0           # new files picked for download (or dry run)
     downloaded: int = 0
@@ -54,12 +56,22 @@ def human_size(num):
 
 
 class Downloader:
-    def __init__(self, client, chat, options, chat_name=None, log=print):
+    """Download the files of one chat.
+
+    ``log`` receives human readable lines (used by the command line).
+    ``on_event(name, **data)``, if given, receives the same information in a
+    structured form for graphical front ends: ``planned``, ``saved``,
+    ``failed``, ``progress``, ``wait`` and ``retry``.
+    """
+
+    def __init__(self, client, chat, options, chat_name=None, log=print,
+                 on_event=None):
         self.client = client
         self.chat = chat
         self.opts = options
         self.chat_name = chat_name or display_name(chat) or str(chat.id)
         self.log = log
+        self.on_event = on_event
         self.stats = Stats()
         self.out_dir = Path(options.out_dir)
         self.state = DownloadLog(self.out_dir / ".tgdl" / f"{chat.id}.tsv")
@@ -74,6 +86,7 @@ class Downloader:
         tasks = set()
         try:
             async for msg in self._messages():
+                self.stats.scanned += 1
                 kind = media_kind(msg)
                 if kind is None:
                     continue
@@ -90,6 +103,7 @@ class Downloader:
                 if self.opts.dry_run:
                     self.log(f"[{msg.id}] would download {rel} "
                              f"({human_size(msg.file.size)})")
+                    self._emit("planned", msg_id=msg.id, path=rel, size=msg.file.size)
                     self.stats.bytes += msg.file.size or 0
                     if self.opts.limit and self.stats.queued >= self.opts.limit:
                         break
@@ -148,7 +162,7 @@ class Downloader:
         fields = {
             "chat": self.chat_name,
             "chat_id": str(self.chat.id),
-            "type": kind,
+            "type": self.opts.type_names.get(kind, kind),
             "year": f"{msg.date:%Y}" if msg.date else "nodate",
             "month": f"{msg.date:%m}" if msg.date else "nodate",
             **sender_fields(sender),
@@ -188,14 +202,14 @@ class Downloader:
                     if part.exists():
                         part.unlink()
                     written = await self.client.download_media(
-                        msg, file=str(part),
-                        progress_callback=self._progress(rel) if self._show_progress else None)
+                        msg, file=str(part), progress_callback=self._progress(msg.id, rel))
                     if not written:
                         raise RuntimeError("message has no downloadable media")
                     os.replace(written, target)
                     break
                 except errors.FloodWaitError as e:
                     self.log(f"[{msg.id}] Telegram asked to wait {e.seconds}s, waiting...")
+                    self._emit("wait", msg_id=msg.id, seconds=e.seconds)
                     await self._sleep(e.seconds + 1)
                 except errors.FileReferenceExpiredError:
                     attempt += 1
@@ -208,12 +222,14 @@ class Downloader:
                         raise
                     delay = 2 ** attempt
                     self.log(f"[{msg.id}] {type(e).__name__}: {e}; retrying in {delay}s")
+                    self._emit("retry", msg_id=msg.id, error=e, delay=delay)
                     await self._sleep(delay)
         except Exception as e:  # noqa: BLE001 - one bad file must not stop the run
             self.stats.failed += 1
             self.stats.failures.append((msg.id, str(rel), f"{type(e).__name__}: {e}"))
             self._clear_progress()
             self.log(f"[{msg.id}] FAILED {rel}: {type(e).__name__}: {e}")
+            self._emit("failed", msg_id=msg.id, path=rel, error=e)
             return
         finally:
             self._reserved.discard(target)
@@ -228,12 +244,23 @@ class Downloader:
         self._clear_progress()
         self.log(f"[{msg.id}] saved {rel} ({human_size(size)}, "
                  f"{human_size(size / elapsed)}/s)")
+        self._emit("saved", msg_id=msg.id, path=rel, size=size, speed=size / elapsed)
 
-    def _progress(self, rel):
+    def _emit(self, name, **data):
+        if self.on_event is not None:
+            self.on_event(name, **data)
+
+    def _progress(self, msg_id, rel):
+        if not (self._show_progress or self.on_event):
+            return None
+
         def callback(current, total):
-            pct = f"{current * 100 // total:3d}%" if total else "   ?"
-            sys.stdout.write(f"\r  {pct} {human_size(current)} / {human_size(total)}  {rel}"[:120].ljust(120))
-            sys.stdout.flush()
+            self._emit("progress", msg_id=msg_id, path=rel, current=current, total=total)
+            if self._show_progress:
+                pct = f"{current * 100 // total:3d}%" if total else "   ?"
+                line = f"\r  {pct} {human_size(current)} / {human_size(total)}  {rel}"
+                sys.stdout.write(line[:120].ljust(120))
+                sys.stdout.flush()
         return callback
 
     def _clear_progress(self):
