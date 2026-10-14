@@ -11,7 +11,7 @@ import os  # noqa: E402
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QObject, Signal  # noqa: E402
+from PySide6.QtCore import QObject, Qt, Signal  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 from telethon import errors  # noqa: E402
 
@@ -41,6 +41,8 @@ class FakeWorker(QObject):
     ask = Signal(str, dict)
     qr = Signal(str)
     notice = Signal(str)
+    chats_partial = Signal(list)
+    flood_wait = Signal(int)
     job_done = Signal(str, object)
     job_failed = Signal(str, object)
     event = Signal(str, dict)
@@ -50,6 +52,7 @@ class FakeWorker(QObject):
         self.submitted = []
         self.downloader = None
         self.calls = []
+        self.me_id = None
 
     def submit(self, name, coro):
         coro.close()
@@ -73,7 +76,7 @@ class FakeWorker(QObject):
     def load_chats(self):
         return self._noop()
 
-    def download(self, chat_id, options):
+    def download(self, chat_id, options, name=None):
         self.calls.append(("download", chat_id, options))
         return self._noop()
 
@@ -87,6 +90,7 @@ def make_window(tmp_path):
     worker = FakeWorker()
     win = window_mod.MainWindow(config=config, worker=worker, autostart=False)
     win.out_edit.setText(str(tmp_path / "out"))
+    win.chat_cache_path = tmp_path / "chats.json"
     return win, worker
 
 
@@ -416,3 +420,85 @@ def test_qr_dialog_in_window(app, tmp_path):
     worker.qr.emit("")                          # scanned: window closes by itself
     assert win.qr_dialog is None
     win.close()
+
+
+# -- chat list: saved copy, background refresh, rate-limit notices -------------
+
+from tgdl.gui.config import load_chat_cache, save_chat_cache  # noqa: E402
+
+CHATS = [(-1001, "العائلة", "group"), (42, "Sara", "user"), (7, "Work", "group")]
+
+
+def test_saved_chats_show_at_once_and_refresh_in_background(app, tmp_path):
+    win, worker = make_window(tmp_path)
+    worker.me_id = 99
+    save_chat_cache(99, CHATS[:2], win.chat_cache_path)
+
+    win.login()
+    worker.job_done.emit("login", "Ahmed")
+    assert win.chat_list.count() == 2                       # instantly, from disk
+    assert worker.submitted[-1] == "chats"
+    assert "جارٍ تحديث" in win.chats_status.text()
+
+    win.chat_list.setCurrentRow(1)                          # pick Sara
+    assert win.start_btn.isEnabled()                        # usable during refresh
+    worker.chats_partial.emit(CHATS[:1])                    # first page: ignored
+    assert win.chat_list.count() == 2
+
+    worker.job_done.emit("chats", CHATS)
+    assert win.chat_list.count() == 3
+    assert win.chat_list.currentItem().data(Qt.UserRole) == 42   # still selected
+    assert "(3)" in win.chats_box.title()
+    assert load_chat_cache(99, win.chat_cache_path) == CHATS
+    assert load_chat_cache(100, win.chat_cache_path) == []  # other account
+    win.close()
+
+
+def test_first_load_fills_progressively_and_shows_waits(app, tmp_path):
+    win, worker = make_window(tmp_path)
+    win.login()
+    worker.job_done.emit("login", "Ahmed")
+    worker.chats_partial.emit(CHATS[:2])
+    assert win.chat_list.count() == 2
+    assert "2" in win.chats_status.text()
+    worker.flood_wait.emit(35)
+    assert "35" in win.chats_status.text() and "35" in win.log_view.toPlainText()
+    worker.job_done.emit("chats", CHATS)
+    assert win.chat_list.count() == 3 and win.chats_status.text() == ""
+    win.close()
+
+
+def test_flood_wait_log_line_becomes_signal():
+    import logging
+    from tgdl.gui.worker import _FloodWaitLog
+    seen = []
+    handler = _FloodWaitLog(seen.append)
+    record = logging.LogRecord("telethon.client.users", logging.INFO, "", 0,
+                               "Sleeping%s for %ds (%s) on %s flood wait",
+                               ("", 35, "0:00:35", "GetDialogsRequest"), None)
+    handler.emit(record)
+    other = logging.LogRecord("x", logging.INFO, "", 0, "connected", (), None)
+    handler.emit(other)
+    assert seen == [35]
+
+
+def test_download_from_saved_list_resolves_chat(app, tmp_path):
+    from types import SimpleNamespace
+    from tgdl.downloader import Options
+
+    class EntityClient:
+        async def get_entity(self, chat_id):
+            return SimpleNamespace(id=5, title="القناة")
+
+        async def iter_messages(self, *a, **kw):
+            return
+            yield
+
+    worker = TelegramWorker()
+    worker.client = EntityClient()
+    try:
+        stats = wait_for(app, worker.submit("download", worker.download(
+            -1005, Options(out_dir=tmp_path), "القناة")))
+        assert stats.scanned == 0 and worker.chats[-1005][1] == "القناة"
+    finally:
+        worker.shutdown()

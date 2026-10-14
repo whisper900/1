@@ -6,6 +6,7 @@ submitted to the worker loop, and its outcome comes back as a Qt signal.
 
 import asyncio
 import datetime
+import logging
 import threading
 import time
 
@@ -102,6 +103,8 @@ class TelegramWorker(QObject):
     ask = Signal(str, dict)             # what to ask, {"error", "info", "resend", ...}
     qr = Signal(str)                    # tg://login URL to show as QR; "" = hide it
     notice = Signal(str)                # a line for the window's log
+    chats_partial = Signal(list)        # chats loaded so far, while the list loads
+    flood_wait = Signal(int)            # Telegram asked us to wait this many seconds
     job_done = Signal(str, object)      # job name, result
     job_failed = Signal(str, object)    # job name, exception
     event = Signal(str, dict)           # downloader event name, data
@@ -116,8 +119,14 @@ class TelegramWorker(QObject):
         self._client_key = None
         self._answer = None
         self.chats = {}           # dialog id -> (entity, name)
+        self.me_id = None
         self.downloader = None    # the running Downloader, for live stats
         self._last_progress = 0.0
+        # Telethon waits out rate limits silently; tell the user about it.
+        self._flood_log = _FloodWaitLog(self.flood_wait.emit)
+        flood_logger = logging.getLogger("telethon.client.users")
+        flood_logger.setLevel(logging.INFO)
+        flood_logger.addHandler(self._flood_log)
 
     # -- plumbing ---------------------------------------------------------
 
@@ -151,6 +160,7 @@ class TelegramWorker(QObject):
         return str(value).strip()
 
     def shutdown(self, timeout=5):
+        logging.getLogger("telethon.client.users").removeHandler(self._flood_log)
         async def close():
             if self.client is not None:
                 await self.client.disconnect()
@@ -183,6 +193,7 @@ class TelegramWorker(QObject):
             else:
                 await self._interactive_login()
         me = await self.client.get_me()
+        self.me_id = me.id
         return display_name(me) or (f"+{me.phone}" if me.phone else str(me.id))
 
     async def _qr_login(self):
@@ -313,8 +324,8 @@ class TelegramWorker(QObject):
                 error = friendly_error(e)
 
     async def load_chats(self):
-        chats = []
-        self.chats.clear()
+        """All chats, newest first; partial lists are emitted every 100 chats."""
+        chats, entities = [], {}
         async for dialog in self.client.iter_dialogs():
             entity = dialog.entity
             if getattr(entity, "is_self", False):
@@ -324,12 +335,22 @@ class TelegramWorker(QObject):
                 kind = ("user" if dialog.is_user else
                         "channel" if dialog.is_channel and not dialog.is_group else
                         "group")
-            self.chats[dialog.id] = (entity, name)
+            entities[dialog.id] = (entity, name)
             chats.append((dialog.id, name, kind))
+            if len(chats) % 100 == 0:
+                self.chats_partial.emit(list(chats))
+        self.chats = entities
         return chats
 
-    async def download(self, chat_id, options):
-        entity, name = self.chats[chat_id]
+    async def download(self, chat_id, options, name=None):
+        if chat_id in self.chats:
+            entity, name = self.chats[chat_id]
+        else:
+            # Picked from the saved list before the refresh finished: the
+            # session file already knows this chat, so this is one request.
+            entity = await self.client.get_entity(chat_id)
+            name = name or display_name(entity) or str(chat_id)
+            self.chats[chat_id] = (entity, name)
         self.downloader = Downloader(self.client, entity, options, chat_name=name,
                                      log=lambda _line: None, on_event=self._on_event)
         return await self.downloader.run()
@@ -342,6 +363,7 @@ class TelegramWorker(QObject):
             self.client = None
             self._client_key = None
         self.chats.clear()
+        self.me_id = None
 
     def _on_event(self, name, **data):
         if name == "progress":
@@ -351,6 +373,21 @@ class TelegramWorker(QObject):
                 return  # Telethon reports every chunk; keep the UI calm
             self._last_progress = now
         self.event.emit(name, data)
+
+
+class _FloodWaitLog(logging.Handler):
+    """Turns Telethon's "Sleeping for 35s ... flood wait" log line into a signal."""
+
+    def __init__(self, callback):
+        super().__init__(logging.INFO)
+        self.callback = callback
+
+    def emit(self, record):
+        if "flood wait" in str(record.msg) and len(record.args or ()) >= 2:
+            try:
+                self.callback(int(record.args[1]))
+            except (TypeError, ValueError):
+                pass
 
 
 def friendly_error(exc):

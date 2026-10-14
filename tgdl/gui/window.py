@@ -21,7 +21,8 @@ from .. import __version__
 from ..downloader import Options
 from ..filters import MessageFilter, normalize_exts
 from . import updater
-from .config import Config, session_path
+from .config import (Config, clear_chat_cache, load_chat_cache, save_chat_cache,
+                     session_path)
 from .worker import RESEND, LoginCancelled, TelegramWorker, friendly_error
 
 APP_TITLE = "منزّل ملفات تليكرام"
@@ -275,6 +276,9 @@ class MainWindow(QMainWindow):
         self.preview = False
         self.qr_dialog = None
         self.pending_update = None
+        self.chats_future = None     # chat list refresh runs beside other jobs
+        self.showing_saved_chats = False
+        self.chat_cache_path = None  # None = the app's settings folder
         self.updater = updater.Updater()
 
         self.setWindowTitle(f"{APP_TITLE} — الإصدار {__version__}")
@@ -289,6 +293,8 @@ class MainWindow(QMainWindow):
         self.worker.event.connect(self._on_download_event)
         self.worker.notice.connect(self.log)
         self.worker.qr.connect(self._on_qr)
+        self.worker.chats_partial.connect(self._on_chats_partial)
+        self.worker.flood_wait.connect(self._on_flood_wait)
         self.updater.checked.connect(self._on_update_checked)
         self.updater.check_failed.connect(self._on_update_check_failed)
 
@@ -328,9 +334,14 @@ class MainWindow(QMainWindow):
         self.refresh_btn = QPushButton("تحديث القائمة")
         self.refresh_btn.clicked.connect(self.load_chats)
         chats_box = QGroupBox("١. اختر المحادثة")
+        self.chats_box = chats_box
+        self.chats_status = QLabel()
+        self.chats_status.setStyleSheet("color: gray;")
+        self.chats_status.setWordWrap(True)
         chats_layout = QVBoxLayout(chats_box)
         chats_layout.addWidget(self.chat_search)
         chats_layout.addWidget(self.chat_list, 1)
+        chats_layout.addWidget(self.chats_status)
         chats_layout.addWidget(self.refresh_btn)
 
         # 2. What to download
@@ -527,7 +538,8 @@ class MainWindow(QMainWindow):
         self.logout_btn.setVisible(self.logged_in)
         self.logout_btn.setEnabled(not busy)
         self.settings_btn.setEnabled(not busy)
-        self.refresh_btn.setEnabled(self.logged_in and not busy)
+        self.refresh_btn.setEnabled(self.logged_in and self.chats_future is None
+                                    and self.job not in ("login", "logout"))
         self.chat_list.setEnabled(self.logged_in and not downloading)
         ready = self.logged_in and has_chat and not busy
         self.start_btn.setEnabled(ready)
@@ -706,9 +718,64 @@ class MainWindow(QMainWindow):
         self.updater.download(release)
 
     def load_chats(self):
+        """Refresh the chat list in the background; downloads stay usable."""
+        if self.chats_future is not None:
+            return
+        if self.chat_list.count() == 0:
+            placeholder = QListWidgetItem("جارٍ تحميل المحادثات...")
+            placeholder.setFlags(Qt.NoItemFlags)
+            self.chat_list.addItem(placeholder)
+            self.showing_saved_chats = False
+        self.chats_status.setText("جارٍ تحديث قائمة المحادثات من تليكرام...")
+        self.chats_future = self.worker.submit("chats", self.worker.load_chats())
+        self._update_state()
+
+    def _show_chats(self, chats):
+        """Replace the list, keeping the selected chat selected."""
+        current = self.chat_list.currentItem()
+        selected = current.data(Qt.UserRole) if current else None
         self.chat_list.clear()
-        self.chat_list.addItem("جارٍ تحميل المحادثات...")
-        self._run("chats", self.worker.load_chats())
+        for chat_id, title, kind in chats:
+            item = QListWidgetItem(f"{title}    ({CHAT_KINDS.get(kind, kind)})")
+            item.setData(Qt.UserRole, chat_id)
+            item.setData(Qt.UserRole + 1, title)
+            self.chat_list.addItem(item)
+            if chat_id == selected:
+                self.chat_list.setCurrentItem(item)
+        self._filter_chats(self.chat_search.text())
+        self.chats_box.setTitle(f"١. اختر المحادثة ({len(chats)})")
+        self._update_state()
+
+    def _on_chats_partial(self, chats):
+        # A saved list is more complete than the first pages of a refresh.
+        if not self.showing_saved_chats:
+            self._show_chats(chats)
+            self.chats_status.setText(f"تم تحميل {len(chats)} محادثة حتى الآن...")
+
+    def _on_flood_wait(self, seconds):
+        text = f"⏳ طلب تليكرام الانتظار {seconds} ثانية، سيكمل البرنامج تلقائياً..."
+        self.log(text)
+        if self.chats_future is not None:
+            self.chats_status.setText(text)
+
+    def _chats_loaded(self, chats):
+        self.chats_future = None
+        self.showing_saved_chats = False
+        self._show_chats(chats)
+        self.chats_status.setText("")
+        if self.worker.me_id is not None:
+            save_chat_cache(self.worker.me_id, chats, self.chat_cache_path)
+
+    def _chats_failed(self, exc):
+        self.chats_future = None
+        if self.showing_saved_chats:
+            self.chats_status.setText("تعذّر تحديث القائمة؛ تُعرض القائمة المحفوظة.")
+        else:
+            self.chat_list.clear()
+            self.chats_status.setText("")
+        self._update_state()
+        if not isinstance(exc, asyncio.CancelledError):
+            QMessageBox.warning(self, APP_TITLE, friendly_error(exc))
 
     def _filter_chats(self, text):
         needle = text.strip().casefold()
@@ -774,7 +841,7 @@ class MainWindow(QMainWindow):
         self.log(f"بدء {verb} الملفات من: {item.data(Qt.UserRole + 1)}")
         self.worker.downloader = None
         self._run("preview" if preview else "download",
-                  self.worker.download(chat_id, options))
+                  self.worker.download(chat_id, options, item.data(Qt.UserRole + 1)))
         self.stats_timer.start()
 
     def stop(self):
@@ -834,30 +901,33 @@ class MainWindow(QMainWindow):
     # -- job results ----------------------------------------------------------
 
     def _on_job_done(self, name, result):
+        if name == "chats":
+            self._chats_loaded(result)
+            return
         self._job_finished()
         if name == "login":
             self.logged_in = True
             self.account_label.setText(f"الحساب: {result}")
+            saved = load_chat_cache(self.worker.me_id, self.chat_cache_path)
+            if saved:
+                self._show_chats(saved)
+                self.showing_saved_chats = True
             self._update_state()
             self.load_chats()
-        elif name == "chats":
-            self.chat_list.clear()
-            for chat_id, title, kind in result:
-                item = QListWidgetItem(f"{title}    ({CHAT_KINDS.get(kind, kind)})")
-                item.setData(Qt.UserRole, chat_id)
-                item.setData(Qt.UserRole + 1, title)
-                self.chat_list.addItem(item)
-            self._filter_chats(self.chat_search.text())
-            self._update_state()
         elif name in ("download", "preview"):
             self._finish_download(result)
         elif name == "logout":
             self.logged_in = False
+            clear_chat_cache(self.chat_cache_path)
+            self.chats_box.setTitle("١. اختر المحادثة")
             self.chat_list.clear()
             self.account_label.setText("تم تسجيل الخروج")
             self._update_state()
 
     def _on_job_failed(self, name, exc):
+        if name == "chats":
+            self._chats_failed(exc)
+            return
         self._job_finished()
         if isinstance(exc, (tg_errors.AuthKeyUnregisteredError,
                             tg_errors.SessionRevokedError)):
@@ -886,8 +956,6 @@ class MainWindow(QMainWindow):
             if "ApiIdInvalid" in type(exc).__name__:
                 self.open_settings()
             return
-        if name == "chats":
-            self.chat_list.clear()
         QMessageBox.warning(self, APP_TITLE, friendly_error(exc))
 
     def _finish_download(self, stats):
