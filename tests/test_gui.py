@@ -38,7 +38,8 @@ def no_dialogs(monkeypatch):
 
 
 class FakeWorker(QObject):
-    ask = Signal(str, str)
+    ask = Signal(str, dict)
+    notice = Signal(str)
     job_done = Signal(str, object)
     job_failed = Signal(str, object)
     event = Signal(str, dict)
@@ -172,23 +173,47 @@ def test_preferences_are_remembered(app, tmp_path):
 
 # -- the real worker's thread bridge and login flow ---------------------------
 
-class LoginClient:
-    """Pretends to be Telethon: wrong code once, then asks for 2FA."""
+from telethon.tl import functions, types  # noqa: E402
 
-    def __init__(self):
+from tgdl.gui.worker import (RESEND, LoginBlocked, normalize_phone,  # noqa: E402
+                             describe_sent_code)
+
+
+def sent(kind, next_type=None, hash_="h"):
+    return types.auth.SentCode(type=kind, phone_code_hash=hash_, next_type=next_type)
+
+
+class LoginClient:
+    """Pretends to be Telethon. ``codes`` is what successive SendCode returns."""
+
+    api_id, api_hash = 1, "x"
+
+    def __init__(self, first, resend=None, verified=None):
+        self.first, self.resend, self.verified = first, resend, verified
+        self.requests = []
         self.signed_in_with = []
 
-    async def send_code_request(self, phone):
-        if phone == "+1":
-            raise errors.PhoneNumberInvalidError(request=None)
-        return type("Sent", (), {"phone_code_hash": "h"})()
+    async def __call__(self, request):
+        self.requests.append(type(request).__name__)
+        if isinstance(request, functions.auth.SendCodeRequest):
+            self.phone = request.phone_number
+            return self.first
+        if isinstance(request, functions.auth.ResendCodeRequest):
+            return self.resend
+        if isinstance(request, functions.account.SendVerifyEmailCodeRequest):
+            if "@" not in request.email:
+                raise errors.EmailInvalidError(request=None)
+            return None
+        if isinstance(request, functions.account.VerifyEmailRequest):
+            return types.account.EmailVerifiedLogin(email="a@b.c", sent_code=self.verified)
+        raise AssertionError(request)
 
     async def sign_in(self, phone=None, code=None, password=None, phone_code_hash=None):
         if code == "00000":
             raise errors.PhoneCodeInvalidError(request=None)
-        if code is not None:
+        if code == "2fa":
             raise errors.SessionPasswordNeededError(request=None)
-        self.signed_in_with.append(password)
+        self.signed_in_with.append(code or password)
 
 
 def wait_for(app, future, timeout=5):
@@ -200,34 +225,92 @@ def wait_for(app, future, timeout=5):
     return future.result(0)
 
 
-def test_worker_login_asks_ui_and_handles_errors(app):
+def login(app, client, replies):
+    """Run the interactive login, answering each question from ``replies``."""
     worker = TelegramWorker()
-    worker.client = LoginClient()
-    replies = iter(["+1", "+15550001", "00000", "12345", "secret"])
+    worker.client = client
+    replies = iter(replies)
     asked = []
 
-    def on_ask(what, error):
-        asked.append((what, error))
+    def on_ask(what, details):
+        asked.append((what, details))
         worker.answer(next(replies))
     worker.ask.connect(on_ask)
     try:
-        fut = worker.submit("login", worker._interactive_login())
-        wait_for(app, fut)
-        assert [w for w, _ in asked] == ["phone", "phone", "code", "code", "password"]
-        assert "رقم الهاتف غير صحيح" in asked[1][1]
-        assert "الكود غير صحيح" in asked[3][1]
-        assert worker.client.signed_in_with == ["secret"]
+        wait_for(app, worker.submit("login", worker._interactive_login()))
     finally:
         worker.shutdown()
+    return asked
+
+
+def test_code_in_telegram_app_resend_by_sms_and_2fa(app):
+    client = LoginClient(
+        first=sent(types.auth.SentCodeTypeApp(5), next_type=types.auth.CodeTypeSms()),
+        resend=sent(types.auth.SentCodeTypeSms(5)))
+    asked = login(app, client, ["0770", "٠٠١ ٥٥٥ ٠١٢٣٤٥٦", RESEND, "٠٠٠٠٠", "2fa", "secret"])
+
+    assert [w for w, _ in asked] == ["phone", "phone", "code", "code", "code", "password"]
+    assert "رمز الدولة" in asked[1][1]["error"]
+    assert client.phone == "15550123456"              # Arabic digits and 00 handled
+    assert "Telegram" in asked[2][1]["info"] and asked[2][1]["resend"] == "برسالة SMS"
+    assert "SMS" in asked[3][1]["info"]                # after the resend
+    assert "غير صحيح" in asked[4][1]["error"]
+    assert client.signed_in_with == ["secret"]
+    assert client.requests == ["SendCodeRequest", "ResendCodeRequest"]
+
+
+def test_code_sent_by_email_says_so(app):
+    client = LoginClient(first=sent(types.auth.SentCodeTypeEmailCode(
+        email_pattern="a***@gmail.com", length=6)))
+    asked = login(app, client, ["+15550123456", "123456"])
+    info = asked[1][1]["info"]
+    assert "بريدك الإلكتروني" in info and "a***@gmail.com" in info
+    assert asked[1][1]["resend"] is None
+    assert client.signed_in_with == ["123456"]
+
+
+def test_login_email_setup_required(app):
+    client = LoginClient(
+        first=sent(types.auth.SentCodeTypeSetUpEmailRequired()),
+        verified=sent(types.auth.SentCodeTypeEmailCode(email_pattern="m***@x.com", length=6)))
+    asked = login(app, client, ["+15550123456", "not-an-email", "me@x.com", "4321", "999999"])
+    assert [w for w, _ in asked] == ["phone", "email", "email", "email_code", "code"]
+    assert "غير صحيح" in asked[2][1]["error"]
+    assert client.signed_in_with == ["999999"]
+
+
+def test_payment_required_is_explained(app):
+    client = LoginClient(first=types.auth.SentCodePaymentRequired(
+        store_product="p", phone_code_hash="h", support_email_address="",
+        support_email_subject="", premium_days=0, currency="USD", amount=1))
+    with pytest.raises(LoginBlocked, match="تطبيق تليكرام الرسمي"):
+        login(app, client, ["+15550123456"])
 
 
 def test_worker_login_cancel(app):
-    worker = TelegramWorker()
-    worker.client = LoginClient()
-    worker.ask.connect(lambda what, error: worker.answer(None))
-    try:
-        fut = worker.submit("login", worker._interactive_login())
-        with pytest.raises(LoginCancelled):
-            wait_for(app, fut)
-    finally:
-        worker.shutdown()
+    client = LoginClient(first=sent(types.auth.SentCodeTypeApp(5)))
+    with pytest.raises(LoginCancelled):
+        login(app, client, [None])
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("+1 (555) 012-3456", "15550123456"),
+    ("00964 770 123 4567", "9647701234567"),
+    ("+٩٦٤٧٧٠١٢٣٤٥٦٧", "9647701234567"),
+    ("07701234567", None),      # no country code: could reach a stranger
+    ("7701234567", None),
+    ("+12", None),
+])
+def test_normalize_phone(raw, expected):
+    assert normalize_phone(raw) == expected
+
+
+def test_code_dialog_resend_and_submit(app):
+    dialog = window_mod.CodeDialog("t", describe_sent_code(sent(types.auth.SentCodeTypeApp(5))),
+                                   error="x", resend="برسالة SMS")
+    dialog._resend()
+    assert dialog.result_value == RESEND
+    dialog = window_mod.CodeDialog("t", "info")
+    dialog.code_edit.setText(" 12345 ")
+    dialog._accept_code()
+    assert dialog.result_value == "12345"

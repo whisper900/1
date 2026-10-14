@@ -17,7 +17,7 @@ from telethon import errors as tg_errors
 from ..downloader import Options
 from ..filters import MessageFilter, normalize_exts
 from .config import Config, session_path
-from .worker import LoginCancelled, TelegramWorker, friendly_error
+from .worker import RESEND, LoginCancelled, TelegramWorker, friendly_error
 
 APP_TITLE = "منزّل ملفات تليكرام"
 
@@ -42,13 +42,15 @@ CHAT_KINDS = {"user": "شخص", "group": "مجموعة", "channel": "قناة", 
 
 ASK_TEXT = {
     "phone": ("تسجيل الدخول",
-              "اكتب رقم هاتف حساب تليكرام كاملاً مع رمز الدولة، ويبدأ بعلامة +"),
-    "code": ("كود الدخول",
-             "أرسل تليكرام كود دخول إلى حسابك (افتح تطبيق تليكرام على هاتفك).\n"
-             "اكتب الكود هنا:"),
+              "اكتب رقم هاتف حساب تليكرام كاملاً مع رمز الدولة، ويبدأ بعلامة +\n"
+              "مثال: +<رمز الدولة><الرقم بدون الصفر الأول>"),
     "password": ("التحقق بخطوتين",
                  "حسابك محمي بكلمة مرور التحقق بخطوتين.\nاكتب كلمة المرور:"),
+    "email": ("بريد الدخول مطلوب",
+              "يطلب تليكرام إضافة بريد إلكتروني لتسجيل الدخول قبل أن يرسل الكود.\n"
+              "اكتب بريدك الإلكتروني، وسيرسل تليكرام إليه كود تأكيد:"),
 }
+CODE_TITLES = {"code": "كود الدخول", "email_code": "كود تأكيد البريد"}
 
 
 def default_out_dir():
@@ -134,6 +136,59 @@ class SettingsDialog(QDialog):
         self.accept()
 
 
+class CodeDialog(QDialog):
+    """Asks for a login code and says where Telegram sent it."""
+
+    def __init__(self, title, info, error="", resend=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(460)
+        self.result_value = None
+
+        info_label = QLabel(info)
+        info_label.setWordWrap(True)
+        info_label.setTextFormat(Qt.RichText)
+        info_label.setOpenExternalLinks(True)
+        self.code_edit = QLineEdit(placeholderText="الكود")
+        self.code_edit.setLayoutDirection(Qt.LeftToRight)
+        self.code_edit.setAlignment(Qt.AlignCenter)
+        font = self.code_edit.font()
+        font.setPointSize(font.pointSize() + 4)
+        self.code_edit.setFont(font)
+
+        layout = QVBoxLayout(self)
+        if error:
+            error_label = QLabel(f"⚠ {error}")
+            error_label.setWordWrap(True)
+            error_label.setStyleSheet("color: #c0392b; font-weight: bold;")
+            layout.addWidget(error_label)
+        layout.addWidget(info_label)
+        layout.addWidget(self.code_edit)
+
+        buttons = QDialogButtonBox()
+        ok = buttons.addButton("تأكيد", QDialogButtonBox.AcceptRole)
+        ok.setDefault(True)
+        buttons.addButton("إلغاء", QDialogButtonBox.RejectRole)
+        if resend:
+            hint = QLabel(f"لم يصلك الكود؟ يمكنك طلبه مرة أخرى {resend}.")
+            hint.setStyleSheet("color: gray;")
+            layout.addWidget(hint)
+            again = buttons.addButton(f"أرسل الكود {resend}", QDialogButtonBox.ActionRole)
+            again.clicked.connect(self._resend)
+        buttons.accepted.connect(self._accept_code)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _accept_code(self):
+        if self.code_edit.text().strip():
+            self.result_value = self.code_edit.text().strip()
+            self.accept()
+
+    def _resend(self):
+        self.result_value = RESEND
+        self.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config=None, worker=None, autostart=True):
         super().__init__()
@@ -154,6 +209,7 @@ class MainWindow(QMainWindow):
         self.worker.job_done.connect(self._on_job_done)
         self.worker.job_failed.connect(self._on_job_failed)
         self.worker.event.connect(self._on_download_event)
+        self.worker.notice.connect(self.log)
 
         self.stats_timer = QTimer(self, interval=300)
         self.stats_timer.timeout.connect(self._refresh_stats)
@@ -426,7 +482,14 @@ class MainWindow(QMainWindow):
         if answer == QMessageBox.Yes:
             self._run("logout", self.worker.logout())
 
-    def _on_ask(self, what, error):
+    def _on_ask(self, what, details):
+        error = details.get("error", "")
+        if what in CODE_TITLES:
+            dialog = CodeDialog(CODE_TITLES[what], details.get("info", ""), error,
+                                details.get("resend"), self)
+            accepted = dialog.exec() == QDialog.Accepted
+            self.worker.answer(dialog.result_value if accepted else None)
+            return
         title, text = ASK_TEXT[what]
         if error:
             text = f"⚠ {error}\n\n{text}"
