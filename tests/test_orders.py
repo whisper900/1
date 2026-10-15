@@ -62,3 +62,32 @@ def test_order_book(tmp_path):
     assert book.files(-100) == [a] and book.counts() == {-100: 1}
     book.clear(-100)
     assert book.files(-100) == [] and book.counts() == {}
+
+
+def test_entries_dates_and_removal(tmp_path):
+    import time as clock
+    from tgdl.gui.orders import within_days
+    book = OrderBook(tmp_path / "orders.json")
+    now = clock.time()
+    files = {}
+    for name, age_days in (("old.jpg", 1000), ("week.jpg", 5), ("today.jpg", 0)):
+        files[name] = tmp_path / name
+        files[name].write_bytes(b"x")
+        book.add(1, "C", files[name], "photo", msg_id=len(files), sent=now - age_days * 86400)
+    entries = book.entries(1)
+    assert [e["path"].name for e in within_days(entries, 0, now)] == ["today.jpg"]
+    assert [e["path"].name for e in within_days(entries, 6, now)] == ["week.jpg", "today.jpg"]
+    book.remove(1, [files["old.jpg"]])
+    assert book.files(1) == [files["week.jpg"], files["today.jpg"]]
+    assert files["old.jpg"].exists()                          # removed from the order only
+    book.remove(1, [files["week.jpg"], files["today.jpg"]])
+    assert book.counts() == {}
+
+
+def test_chat_marks(tmp_path):
+    from tgdl.gui.orders import ChatMarks
+    marks = ChatMarks(tmp_path / "marks.json")
+    assert marks.get(5) == 0
+    marks.advance(5, 120)
+    marks.advance(5, 90)                                      # never goes back
+    assert marks.get(5) == 120 and ChatMarks(tmp_path / "marks.json").get(5) == 120

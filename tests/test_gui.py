@@ -44,6 +44,26 @@ def delete_windows(app, no_dialogs):
 
 
 @pytest.fixture(autouse=True)
+def first_download(monkeypatch):
+    """Answer "which period?" before a first download (default: everything)."""
+    answer = {"choice": "all", "asked": 0}
+
+    class Dialog:
+        def __init__(self, name, parent=None):
+            pass
+
+        def exec(self):
+            answer["asked"] += 1
+            self.choice = answer["choice"]
+            return 1
+
+        def setParent(self, parent):
+            pass
+    monkeypatch.setattr(window_mod, "FirstDownloadDialog", Dialog)
+    return answer
+
+
+@pytest.fixture(autouse=True)
 def no_dialogs(monkeypatch):
     """Message boxes would block the test; record them instead."""
     shown = []
@@ -114,6 +134,7 @@ def make_window(tmp_path):
     win.chat_cache_path = tmp_path / "chats.json"
     win.cleanup_store = tmp_path / "cleanup.json"
     win.orders_path = tmp_path / "orders.json"
+    win.marks_path = tmp_path / "marks.json"
     return win, worker
 
 
@@ -1138,3 +1159,161 @@ def test_picker_quick_ranges_and_thumbnails(app):
     assert visible_ids(dialog) == [2, 1]                        # oldest first, like the chat
     dialog.quick_range(None)
     assert visible_ids(dialog) == [3, 2, 1]
+
+
+# -- protection against downloading or printing a chat's whole history ------------
+
+def test_first_download_asks_once_then_continues_after_the_last(app, tmp_path, first_download):
+    from tgdl.downloader import Stats
+    win, worker = make_window(tmp_path)
+    win.logged_in = True
+    worker.job_done.emit("chats", CHATS)
+    win.chat_list.setCurrentRow(1)                            # Sara (42)
+
+    first_download["choice"] = "today"
+    win.start()
+    _, chat_id, opts = worker.calls[-1]
+    assert first_download["asked"] == 1 and opts.min_id == 0
+    assert opts.since == window_mod.local_midnight(0)         # today's files only
+    worker.job_done.emit("download", Stats(downloaded=2, matched=2, last_msg_id=950))
+
+    win.start()                                               # next time: no question
+    _, _, opts = worker.calls[-1]
+    assert first_download["asked"] == 1 and opts.min_id == 950
+    assert "بعد آخر تنزيل" in win.log_view.toPlainText()
+    worker.job_failed.emit("download", asyncio.CancelledError())
+
+    first_download["choice"] = None                           # cancelling asks nothing else
+    win.chat_list.setCurrentRow(2)
+    calls = len(worker.calls)
+    win.start()
+    assert len(worker.calls) == calls
+    win.close()
+
+
+def test_failed_download_does_not_move_the_marker(app, tmp_path):
+    from tgdl.downloader import Stats
+    win, worker = make_window(tmp_path)
+    win.logged_in = True
+    worker.job_done.emit("chats", CHATS)
+    win.chat_list.setCurrentRow(1)
+    win.start()
+    worker.job_done.emit("download", Stats(downloaded=1, failed=1, last_msg_id=500))
+    assert win._marks().get(42) == 0                          # failed file is retried next time
+    win.close()
+
+
+def test_first_download_pick_opens_the_picker(app, tmp_path, first_download):
+    win, worker = make_window(tmp_path)
+    win.logged_in = True
+    worker.job_done.emit("chats", CHATS)
+    win.chat_list.setCurrentRow(1)
+    worker.scan = lambda chat_id, options, name: worker._noop()
+    first_download["choice"] = "pick"
+    win.start()
+    assert worker.submitted[-1] == "scan"
+    win.close()
+
+
+def old_order(win, tmp_path, ages_in_days):
+    """An order for Sara whose files were sent ``ages_in_days`` ago."""
+    import time as clock
+    book = win._orders()
+    paths = []
+    for i, age in enumerate(ages_in_days, 1):
+        path = tmp_path / "out" / "Sara" / f"{i}.jpg"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+        book.add(42, "Sara", path, "photo", msg_id=i, sent=clock.time() - age * 86400)
+        paths.append(path)
+    win._refresh_badges()
+    win.chat_list.setCurrentRow(1)
+    win._refresh_order()
+    return paths
+
+
+def test_old_files_are_hidden_and_printing_asks_first(app, tmp_path, monkeypatch, no_dialogs):
+    win, worker = order_window(tmp_path)
+    paths = old_order(win, tmp_path, [1000] * 600 + [0, 0, 1])     # 600 old + 3 new
+    assert win.order_range.currentData() == 6                       # last 7 days by default
+    assert not win.order_warning.isHidden() and "600 ملف غير معروض" in win.order_warning.text()
+    assert "3 من 603 ملف" in win.order_summary.text()
+    assert win._order_files() == paths[600:]
+
+    printed = []
+    monkeypatch.setattr(window_mod.printing, "print_files",
+                        lambda printer, files, *a: printed.append(files) or
+                        window_mod.printing.PrintResult(pages=len(files)))
+
+    class Dialog:
+        def __init__(self, *a):
+            pass
+
+        def setWindowTitle(self, t):
+            pass
+
+        def exec(self):
+            return window_mod.QDialog.Accepted
+    monkeypatch.setattr(window_mod, "QPrintDialog", Dialog)
+    win.print_order()
+    assert printed[-1] == paths[600:]                               # only the recent files
+    assert not any(kind == "question" for kind, _ in no_dialogs)    # small, recent: no question
+
+    win.order_range.setCurrentIndex(win.order_range.findData("all"))
+    win._order_range_chosen(0)
+    win.print_order()
+    question = [text for kind, text in no_dialogs if kind == "question"][-1]
+    assert "603 ملف" in question and "600 ملف أُرسل قبل أكثر من أسبوع" in question
+    win.close()
+
+
+def test_delivering_the_shown_files_keeps_the_rest(app, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    monkeypatch.setattr(QMessageBox, "clickedButton", lambda self: next(
+        b for b in self.buttons() if self.buttonRole(b) == QMessageBox.DestructiveRole))
+    win, worker = order_window(tmp_path)
+    paths = old_order(win, tmp_path, [400, 400, 0])
+    win.deliver_order()                                             # shown: today's file
+    assert not paths[2].exists() and paths[0].exists() and paths[1].exists()
+    assert win._orders().files(42) == paths[:2]                     # old ones still listed
+    assert win.chat_list.item(1).data(window_mod.CHAT_BADGE_ROLE) == 2
+    win.close()
+
+
+def test_pick_files_inside_the_order(app, tmp_path, monkeypatch):
+    win, worker = order_window(tmp_path)
+    paths = old_order(win, tmp_path, [0, 0, 0])
+
+    class Picker:
+        def __init__(self, items, already, parent):
+            self.ok_btn = window_mod.QPushButton()
+
+        def setWindowTitle(self, t):
+            pass
+
+        def exec(self):
+            return window_mod.QDialog.Accepted
+
+        def selected_ids(self):
+            return [0, 2]
+
+        def setParent(self, p):
+            pass
+    monkeypatch.setattr(window_mod, "SelectFilesDialog", Picker)
+    win.order_range.setCurrentIndex(win.order_range.findData("pick"))
+    win._order_range_chosen(0)
+    assert win._order_files() == [paths[0], paths[2]]
+    assert "2 من 3 ملف" in win.order_summary.text()
+    win.close()
+
+
+def test_auto_received_files_advance_the_marker(app, tmp_path):
+    win, worker = order_window(tmp_path)
+    win.auto_btn.setChecked(True)
+    path = tmp_path / "out" / "Sara" / "1.jpg"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"x")
+    worker.auto_event.emit("saved", {"path": Path("Sara/1.jpg"), "msg_id": 77, "kind": "photo",
+                                     "chat_id": 42, "chat_name": "Sara", "size": 1})
+    assert win._marks().get(42) == 77
+    win.close()

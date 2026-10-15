@@ -1,6 +1,7 @@
 """Main window of the desktop app (Arabic, right-to-left)."""
 
 import asyncio
+import datetime
 import io
 import sys
 import time as clock
@@ -12,7 +13,7 @@ from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QIcon, QImage, QImageReader, QPainter, QPixmap
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDialog, QDialogButtonBox, QFrame, QHBoxLayout, QInputDialog,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFrame, QHBoxLayout, QInputDialog,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
     QPlainTextEdit, QProgressBar, QProgressDialog, QPushButton, QSplitter, QStackedWidget,
     QSystemTrayIcon, QToolButton, QVBoxLayout, QWidget)
@@ -23,7 +24,7 @@ from ..pdfmerge import merge_images
 from . import cleanup, printing, updater
 from .config import (Config, app_dir, chat_cache_age, clear_chat_cache, load_chat_cache,
                      save_chat_cache, session_path)
-from .orders import OrderBook, group_of, summarize
+from .orders import ChatMarks, OrderBook, group_of, summarize, within_days
 from .settings import (TAB_ACCOUNT, TAB_FILES, SettingsDialog, build_options,
                        default_out_dir, format_money, prefs, short_summary)
 from .picker import SelectFilesDialog, size_ar
@@ -139,6 +140,42 @@ class CodeDialog(QDialog):
         self.accept()
 
 
+class FirstDownloadDialog(QDialog):
+    """Asked before the first download from a chat, which may hold years of files."""
+
+    def __init__(self, chat_name, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("أول تنزيل من هذه المحادثة")
+        self.setMinimumWidth(460)
+        self.choice = None
+        text = QLabel(f"لم تنزّل من «{chat_name}» من قبل، وقد تحتوي المحادثة على ملفات "
+                      "قديمة كثيرة.\nمن أي فترة تريد الملفات؟")
+        text.setWordWrap(True)
+        layout = QVBoxLayout(self)
+        layout.addWidget(text)
+        for choice, label, kind in (("today", "ملفات اليوم فقط", "primary"),
+                                    ("week", "آخر 7 أيام", None),
+                                    ("pick", "اختيار الملفات بنفسي...", None),
+                                    ("all", "كل ملفات المحادثة منذ البداية", "ghost")):
+            button = QPushButton(label)
+            if kind:
+                set_kind(button, kind)
+            button.clicked.connect(lambda _=False, c=choice: self._choose(c))
+            layout.addWidget(button)
+        cancel = QPushButton("إلغاء")
+        cancel.clicked.connect(self.reject)
+        layout.addWidget(cancel, alignment=Qt.AlignLeft)
+
+    def _choose(self, choice):
+        self.choice = choice
+        self.accept()
+
+
+def local_midnight(days_ago=0):
+    day = datetime.date.today() - datetime.timedelta(days=days_ago)
+    return datetime.datetime.combine(day, datetime.time.min).astimezone()
+
+
 class LoginMethodDialog(QDialog):
     """QR code (no SMS needed) or phone number + code."""
 
@@ -231,6 +268,9 @@ class MainWindow(QMainWindow):
         self.updater = updater.Updater()
         self.orders_path = None      # None = the app's settings folder
         self.run_chat = None         # (chat id, name) of the running download
+        self.run_new_files = False   # the running download is "download new files"
+        self.marks_path = None       # None = the app's settings folder
+        self.order_picks = {}        # chat id -> paths picked by hand in the order card
         self.auto_out_dir = None
         self.tray = None
         self._quitting = False
@@ -500,6 +540,18 @@ class MainWindow(QMainWindow):
         order_top.addWidget(self.order_title)
         order_top.addStretch(1)
         order_top.addWidget(self.order_age)
+        range_row = QHBoxLayout()
+        range_row.addWidget(QLabel("الملفات المعروضة:"))
+        self.order_range = QComboBox()
+        for label, value in (("كل الطلب", "all"), ("اليوم", 0), ("آخر يومين", 1),
+                             ("آخر 7 أيام", 6), ("اختيار يدوي...", "pick")):
+            self.order_range.addItem(label, value)
+        self.order_range.activated.connect(self._order_range_chosen)
+        range_row.addWidget(self.order_range)
+        range_row.addStretch(1)
+        self.order_warning = QLabel()
+        self.order_warning.setWordWrap(True)
+        self.order_warning.setStyleSheet("color: #B54708;")
         self.order_summary = QLabel()
         self.order_summary.setWordWrap(True)
         self.order_pages = QLabel()
@@ -521,6 +573,8 @@ class MainWindow(QMainWindow):
         order_actions.addStretch(1)
         order_actions.addWidget(self.deliver_btn)
         self.order_card.body.addLayout(order_top)
+        self.order_card.body.addLayout(range_row)
+        self.order_card.body.addWidget(self.order_warning)
         self.order_card.body.addWidget(self.order_summary)
         self.order_card.body.addWidget(self.order_pages)
         self.order_card.body.addLayout(order_actions)
@@ -914,8 +968,30 @@ class MainWindow(QMainWindow):
         chat_id, name = chat
         if ids:
             message = f"بدء تنزيل {len(ids)} ملف محدد من: {name}"
+        elif preview:
+            message = f"بدء معاينة الملفات من: {name}"
         else:
-            message = f"بدء {'معاينة' if preview else 'تنزيل'} الملفات من: {name}"
+            last = self._marks().get(chat_id)
+            if last:
+                # "New" means what arrived after the last download from this chat.
+                options.min_id = last
+                message = f"تنزيل الملفات التي وصلت من {name} بعد آخر تنزيل"
+            else:
+                dialog = FirstDownloadDialog(name, self)
+                dialog.exec()
+                choice = dialog.choice
+                _dispose(dialog)
+                if choice is None:
+                    return
+                if choice == "pick":
+                    self.pick_files()
+                    return
+                if choice in ("today", "week"):
+                    start = local_midnight(0 if choice == "today" else 6)
+                    options.since = max(options.since, start) if options.since else start
+                message = {"today": "تنزيل ملفات اليوم من", "week": "تنزيل ملفات آخر 7 أيام من",
+                           "all": "تنزيل كل الملفات من"}[choice] + f": {name}"
+        self.run_new_files = not preview and not ids
         self._begin("preview" if preview else "download", message,
                     lambda: self.worker.download(chat_id, options, name), preview, chat)
 
@@ -1031,6 +1107,10 @@ class MainWindow(QMainWindow):
             else:
                 self.load_chats()
         elif name in ("download", "preview"):
+            if (name == "download" and self.run_new_files and not result.failed
+                    and self.run_chat is not None):
+                # Next "download new files" starts after the newest message seen now.
+                self._marks().advance(self.run_chat[0], result.last_msg_id)
             self._finish_download(result)
         elif name == "scan":
             self._show_picker(result)
@@ -1115,8 +1195,13 @@ class MainWindow(QMainWindow):
     def _orders(self):
         return OrderBook(self.orders_path or app_dir() / "orders.json")
 
+    def _marks(self):
+        return ChatMarks(self.marks_path or app_dir() / "marks.json")
+
     def _file_saved(self, chat_id, chat_name, path, data, delete_after):
-        self._orders().add(chat_id, chat_name, path, data.get("kind"), data.get("msg_id"))
+        sent = data.get("date")
+        self._orders().add(chat_id, chat_name, path, data.get("kind"), data.get("msg_id"),
+                           sent.timestamp() if sent else None)
         if delete_after:
             cleanup.schedule(self._cleanup_store(), [path], delete_after,
                              root=Path(prefs(self.config)["out_dir"]))
@@ -1134,16 +1219,83 @@ class MainWindow(QMainWindow):
             if chat_id is not None:
                 item.setData(CHAT_BADGE_ROLE, counts.get(chat_id, 0))
 
-    def _order_files(self):
+    def _order_entries(self):
         chat = self._current_chat()
-        return self._orders().files(chat[0]) if chat else []
+        return self._orders().entries(chat[0]) if chat else []
 
-    def _refresh_order(self):
+    def _shown_entries(self):
+        """The order's files the card works on, after its date filter."""
+        entries = self._order_entries()
+        value = self.order_range.currentData()
+        if value == "pick":
+            chat = self._current_chat()
+            picked = self.order_picks.get(chat[0], set()) if chat else set()
+            return [e for e in entries if str(e["path"]) in picked]
+        if isinstance(value, int):
+            return within_days(entries, value)
+        return entries
+
+    def _order_files(self):
+        return [e["path"] for e in self._shown_entries()]
+
+    def _default_order_range(self, entries):
+        """Old files in the order? Then show the last week unless told otherwise."""
+        week_ago = clock.time() - 7 * 86400
+        index = self.order_range.findData(6 if any(e["sent"] < week_ago for e in entries)
+                                          else "all")
+        self.order_range.setCurrentIndex(index)
+
+    def _order_range_chosen(self, _index):
+        if self.order_range.currentData() == "pick":
+            self._pick_order_files()
+        self._refresh_order(keep_range=True)
+
+    def _pick_order_files(self):
         chat = self._current_chat()
-        files = self._order_files()
-        self.order_card.setVisible(bool(files))
-        if not files:
+        entries = self._order_entries()
+        if not chat or not entries:
             return
+        items = []
+        for index, entry in enumerate(entries):
+            try:
+                size = entry["path"].stat().st_size
+            except OSError:
+                size = None
+            items.append({"msg_id": index, "path": entry["path"], "size": size,
+                          "kind": entry.get("kind") or "document",
+                          "date": datetime.datetime.fromtimestamp(entry["sent"]).astimezone(),
+                          "file_name": entry["path"].name, "sender": entry["path"].parent.name})
+        dialog = SelectFilesDialog(items, 0, self)
+        dialog.setWindowTitle("اختر ملفات الطلب")
+        dialog.ok_btn.setText("اعتماد المحدد")
+        accepted = dialog.exec() == QDialog.Accepted
+        ids = dialog.selected_ids() if accepted else []
+        _dispose(dialog)
+        if ids:
+            self.order_picks[chat[0]] = {str(entries[i]["path"]) for i in ids}
+        elif not self.order_picks.get(chat[0]):
+            self.order_range.setCurrentIndex(self.order_range.findData("all"))
+
+    def _refresh_order(self, keep_range=False):
+        chat = self._current_chat()
+        entries = self._order_entries()
+        self.order_card.setVisible(bool(entries))
+        if not entries:
+            return
+        if not keep_range:
+            self._default_order_range(entries)
+        files = self._order_files()
+        oldest = min(e["sent"] for e in entries)
+        hidden = len(entries) - len(files)
+        if oldest < clock.time() - 7 * 86400:
+            when = datetime.datetime.fromtimestamp(oldest).strftime("%Y/%m/%d")
+            text = f"⚠ في هذا الطلب ملفات قديمة (أقدمها أُرسل {when})."
+            if hidden:
+                text += f" {hidden} ملف غير معروض ولن يُطبع."
+            self.order_warning.setText(text)
+            self.order_warning.show()
+        else:
+            self.order_warning.hide()
         p = prefs(self.config)
         result = summarize(files, p["price"], self._page_cache)
         self.order_title.setText(f"🧾 طلب {chat[1]}")
@@ -1151,15 +1303,19 @@ class MainWindow(QMainWindow):
         if last:
             minutes = int((clock.time() - last) // 60)
             self.order_age.setText("آخر ملف: الآن" if minutes < 1 else f"آخر ملف قبل {minutes} دقيقة")
-        self.order_summary.setText(f"{result.files} ملف: {result.describe()}")
+        shown = f"{result.files} ملف" if not hidden else f"{result.files} من {len(entries)} ملف"
+        self.order_summary.setText(f"{shown}: {result.describe()}" if files else
+                                   "لا توجد ملفات في هذه الفترة. اختر «كل الطلب» لرؤيتها.")
         pages = f"المجموع: {result.pages} صفحة"
         if p["price"]:
             pages += f" × {format_money(p['price'])} = {format_money(result.price, p['currency'])}"
         if result.unknown:
             pages += f"  (+ {len(result.unknown)} ملف لا يُعرف عدد صفحاته)"
         self.order_pages.setText(pages)
-        self.merge_btn.setEnabled(any(group_of(f) == "images" for f in files)
-                                  and self.job not in ("download", "preview", "scan"))
+        busy = self.job in ("download", "preview", "scan")
+        self.merge_btn.setEnabled(any(group_of(f) == "images" for f in files) and not busy)
+        self.print_btn.setEnabled(bool(files) and not busy)
+        self.deliver_btn.setEnabled(bool(files) and not busy)
 
     def _order_folder(self, files):
         try:
@@ -1174,9 +1330,19 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     def print_order(self):
-        files = self._order_files()
+        entries = self._shown_entries()
+        files = [e["path"] for e in entries]
         if not files:
             return
+        result = summarize(files, 0, self._page_cache)
+        old = [e for e in entries if e["sent"] < clock.time() - 7 * 86400]
+        if result.pages >= 100 or old:
+            text = f"سيتم طباعة {len(files)} ملف ({result.pages} صفحة)."
+            if old:
+                text += f"\nمنها {len(old)} ملف أُرسل قبل أكثر من أسبوع."
+            text += "\n\nهل تريد المتابعة؟ (يمكنك تحديد الملفات من «الملفات المعروضة»)"
+            if QMessageBox.question(self, "تأكيد الطباعة", text) != QMessageBox.Yes:
+                return
         printer = QPrinter(QPrinter.HighResolution)
         dialog = QPrintDialog(printer, self)
         dialog.setWindowTitle("طباعة الطلب")
@@ -1258,7 +1424,7 @@ class MainWindow(QMainWindow):
     def deliver_order(self):
         chat = self._current_chat()
         files = self._order_files()
-        if not chat:
+        if not chat or not files:
             return
         box = QMessageBox(QMessageBox.Question, "تم التسليم",
                           f"إنهاء طلب {chat[1]} ({len(files)} ملف)؟", parent=self)
@@ -1279,7 +1445,8 @@ class MainWindow(QMainWindow):
                 except OSError:
                     pass
             self.log(f"🗑 حُذفت ملفات طلب {chat[1]} ({len(files)} ملف).")
-        self._orders().clear(chat[0])
+        self._orders().remove(chat[0], files)
+        self.order_picks.pop(chat[0], None)
         self._refresh_badges()
         self._refresh_order()
 
@@ -1348,6 +1515,7 @@ class MainWindow(QMainWindow):
 
     def _on_auto_event(self, name, data):
         if name == "saved" and self.auto_out_dir is not None:
+            self._marks().advance(data["chat_id"], data.get("msg_id"))
             p = prefs(self.config)
             delete_after = p["delete_after"] * 60 if p["auto_delete"] else None
             self._file_saved(data["chat_id"], data["chat_name"], self.auto_out_dir / data["path"],

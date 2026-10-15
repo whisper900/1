@@ -263,3 +263,20 @@ def test_day_folder_and_thumbnail(tmp_path):
     local_day = day(5).astimezone().strftime("%Y-%m-%d")
     assert str(data["path"]).startswith(local_day)
     assert data["thumb"][:2] == b"\xff\xd8"               # a JPEG preview
+
+
+def test_min_id_starts_after_the_last_download(tmp_path):
+    client = FakeClient([FakeMsg(i, SARA, name=f"{i}.pdf") for i in range(1, 6)])
+    stats, _ = run(client, tmp_path, min_id=3)
+    assert client.download_calls == [4, 5] and client.min_id_used == 3
+    assert stats.last_msg_id == 5
+
+
+def test_saved_event_carries_kind_and_send_date(tmp_path):
+    events = []
+    client = FakeClient([FakeMsg(1, AHMED, kind="photo", ext=".jpg", date=day(7))])
+    dl = Downloader(client, CHAT, Options(out_dir=tmp_path), log=lambda _: None,
+                    on_event=lambda name, **d: events.append((name, d)))
+    asyncio.run(dl.run())
+    saved = [d for n, d in events if n == "saved"][0]
+    assert saved["kind"] == "photo" and saved["date"] == day(7)

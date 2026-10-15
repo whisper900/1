@@ -27,6 +27,7 @@ class Options:
     since: object = None      # aware datetime, inclusive
     until: object = None      # aware datetime, exclusive
     ids: list = None          # only these message ids
+    min_id: int = 0           # only messages after this one (e.g. the last download)
     limit: int = None         # stop after this many matching files
     parallel: int = 3
     dry_run: bool = False
@@ -40,6 +41,7 @@ class Options:
 @dataclass
 class Stats:
     scanned: int = 0          # messages looked at
+    last_msg_id: int = 0      # newest message looked at
     matched: int = 0
     queued: int = 0           # new files picked for download (or dry run)
     downloaded: int = 0
@@ -105,6 +107,7 @@ class Downloader:
         try:
             async for msg in self._messages():
                 self.stats.scanned += 1
+                self.stats.last_msg_id = max(self.stats.last_msg_id, msg.id)
                 kind = media_kind(msg)
                 if kind is None:
                     continue
@@ -166,7 +169,10 @@ class Downloader:
             return
 
         async for msg in self.client.iter_messages(
-                self.chat, reverse=True, offset_date=self.opts.since):
+                self.chat, reverse=True, offset_date=self.opts.since,
+                min_id=self.opts.min_id or 0):
+            if self.opts.min_id and msg.id <= self.opts.min_id:
+                continue
             if self.opts.since and msg.date < self.opts.since:
                 continue
             if self.opts.until and msg.date >= self.opts.until:
@@ -282,7 +288,8 @@ class Downloader:
         self._clear_progress()
         self.log(f"[{msg.id}] saved {rel} ({human_size(size)}, "
                  f"{human_size(size / elapsed)}/s)")
-        self._emit("saved", msg_id=msg.id, path=rel, size=size, speed=size / elapsed)
+        self._emit("saved", msg_id=msg.id, path=rel, size=size, speed=size / elapsed,
+                   kind=media_kind(msg), date=msg.date)
 
     def _emit(self, name, **data):
         if self.on_event is not None:

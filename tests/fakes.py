@@ -54,10 +54,13 @@ class FakeClient:
         self.fail = fail or {}
         self.download_calls = []
 
-    async def iter_messages(self, chat, reverse=False, offset_date=None):
+    async def iter_messages(self, chat, reverse=False, offset_date=None, min_id=0):
         assert reverse, "downloader should walk oldest first"
+        self.min_id_used = min_id
         for msg in sorted(self.messages, key=lambda m: m.id):
-            if offset_date and msg.date <= offset_date:
+            if min_id and msg.id <= min_id:      # like Telegram: min_id wins over the date
+                continue
+            if not min_id and offset_date and msg.date <= offset_date:
                 continue
             yield msg
 

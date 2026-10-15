@@ -109,6 +109,45 @@ def summarize(paths, price_per_page=0.0, page_cache=None):
     return summary
 
 
+def within_days(entries, days, now=None):
+    """Entries sent today (days=0), since yesterday (1), ... in local time."""
+    import datetime as dt
+    today = dt.datetime.fromtimestamp(now if now is not None else time.time()).date()
+    first = today - dt.timedelta(days=days)
+    return [e for e in entries if dt.datetime.fromtimestamp(e["sent"]).date() >= first]
+
+
+class ChatMarks:
+    """The newest message already downloaded from each chat, so "download new
+    files" can start right after it instead of at the start of the chat."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def _load(self):
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def get(self, chat_id):
+        return int(self._load().get(str(chat_id), 0))
+
+    def advance(self, chat_id, msg_id):
+        if not msg_id:
+            return
+        data = self._load()
+        if msg_id > int(data.get(str(chat_id), 0)):
+            data[str(chat_id)] = int(msg_id)
+            tmp = self.path.with_suffix(".tmp")
+            try:
+                tmp.write_text(json.dumps(data), encoding="utf-8")
+                os.replace(tmp, self.path)
+            except OSError:
+                pass
+
+
 class OrderBook:
     """``{chat id: {"name", "files": [{"path", "kind", "msg_id", "at"}]}}`` on disk."""
 
@@ -130,20 +169,43 @@ class OrderBook:
         except OSError:
             pass
 
-    def add(self, chat_id, chat_name, path, kind=None, msg_id=None):
+    def add(self, chat_id, chat_name, path, kind=None, msg_id=None, sent=None):
+        """``sent``: when the customer sent the file (a timestamp)."""
         data = self._load()
         order = data.setdefault(str(chat_id), {"name": chat_name, "files": []})
         order["name"] = chat_name
         if not any(f["path"] == str(path) for f in order["files"]):
             order["files"].append({"path": str(path), "kind": kind, "msg_id": msg_id,
-                                   "at": time.time()})
+                                   "at": time.time(), "sent": sent})
         self._save(data)
+
+    def entries(self, chat_id):
+        """The order's files that still exist, in message order, as dicts with
+        ``path`` (Path), ``kind``, ``msg_id`` and ``sent`` (timestamp)."""
+        order = self._load().get(str(chat_id), {"files": []})
+        result = []
+        for entry in sorted(order["files"], key=lambda f: (f.get("msg_id") or 0, f["at"])):
+            path = Path(entry["path"])
+            if path.exists():
+                result.append({**entry, "path": path,
+                               "sent": entry.get("sent") or entry["at"]})
+        return result
 
     def files(self, chat_id):
         """Paths of the chat's order that still exist, in message order."""
-        order = self._load().get(str(chat_id), {"files": []})
-        entries = sorted(order["files"], key=lambda f: (f.get("msg_id") or 0, f["at"]))
-        return [Path(f["path"]) for f in entries if Path(f["path"]).exists()]
+        return [entry["path"] for entry in self.entries(chat_id)]
+
+    def remove(self, chat_id, paths):
+        """Take some files out of an order (the files themselves stay)."""
+        data = self._load()
+        order = data.get(str(chat_id))
+        if order is None:
+            return
+        drop = {str(p) for p in paths}
+        order["files"] = [f for f in order["files"] if f["path"] not in drop]
+        if not order["files"]:
+            data.pop(str(chat_id))
+        self._save(data)
 
     def last_at(self, chat_id):
         files = self._load().get(str(chat_id), {"files": []})["files"]
