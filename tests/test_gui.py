@@ -17,6 +17,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 from telethon import errors  # noqa: E402
 
 from tgdl.downloader import Stats  # noqa: E402
+from tgdl.filters import KINDS  # noqa: E402
 from tgdl.gui import window as window_mod  # noqa: E402
 from tgdl.gui.config import Config  # noqa: E402
 from tgdl.gui.worker import LoginCancelled, TelegramWorker  # noqa: E402
@@ -626,30 +627,84 @@ def test_chat_marks_shown_and_old_cache_format_read(app, tmp_path):
     win.close()
 
 
-def picked(n, kind="document", name=None, sender="Ahmed", size=1000):
+def picked(n, kind="document", name=None, sender="Ahmed", size=1000, ext=".pdf"):
     import datetime as dt
-    return {"msg_id": n, "path": Path(f"c/{sender}/{n}.pdf"), "size": size, "kind": kind,
-            "date": dt.datetime(2025, 1, n, tzinfo=dt.timezone.utc),
+    return {"msg_id": n, "path": Path(f"c/{sender}/{n}{ext}"), "size": size, "kind": kind,
+            "date": dt.datetime(2025, 1, n, 12, tzinfo=dt.timezone.utc),
             "file_name": name, "sender": sender}
 
 
+def visible_ids(dialog):
+    from tgdl.gui.picker import ID_ROLE
+    return [r.data(0, ID_ROLE) for r in dialog._rows() if not r.isHidden()]
+
+
 def test_select_files_dialog(app):
+    from tgdl.gui.picker import ID_ROLE
     items = [picked(3, name="c.pdf"), picked(1, name="a.pdf", sender="Sara"),
-             picked(2, kind="photo", size=5000)]
+             picked(2, kind="photo", size=5000, ext=".jpg")]
     dialog = window_mod.SelectFilesDialog(items, already=4)
     rows = dialog._rows()
-    assert [r.data(0, window_mod.ID_ROLE) for r in rows] == [1, 2, 3]   # oldest first
+    assert [r.data(0, ID_ROLE) for r in rows] == [1, 2, 3]   # oldest first
     assert not dialog.ok_btn.isEnabled()
 
     dialog.search.setText("sara")
-    dialog._set_visible(window_mod.Qt.Checked)       # "select all" ticks visible rows only
+    dialog._set_visible(Qt.Checked)                  # ticks the visible rows only
     assert dialog.selected_ids() == [1]
     dialog.search.setText("")
     dialog._toggle(rows[1], 0)                        # double-click the photo
     assert dialog.selected_ids() == [1, 2]
     assert "2" in dialog.ok_btn.text() and dialog.ok_btn.isEnabled()
-    dialog._set_visible(window_mod.Qt.Unchecked)
+    dialog._set_visible(Qt.Unchecked)
     assert dialog.selected_ids() == []
+
+
+def test_picker_filters(app):
+    items = [
+        picked(1, name="a.pdf", sender="Sara"),
+        picked(2, kind="photo", size=5 * 1024 ** 2, ext=".jpg"),
+        picked(3, name="report.docx", ext=".docx"),
+        picked(4, kind="video", size=300 * 1024 ** 2, ext=".mp4", sender="Sara"),
+        picked(5, kind="sticker", ext=".webp"),
+        picked(6, name="b.pdf"),
+    ]
+    # Types start from the settings: stickers off.
+    dialog = window_mod.SelectFilesDialog(items, kinds=["photo", "video", "document"])
+    assert set(dialog.kind_chips) == {"photo", "video", "document", "sticker"}
+    assert "(3)" in dialog.kind_chips["document"].text()
+    assert visible_ids(dialog) == [1, 2, 3, 4, 6]
+
+    dialog.kind_chips["document"].setChecked(False)
+    assert visible_ids(dialog) == [2, 4]
+    dialog.kind_chips["document"].setChecked(True)
+
+    dialog.sender_combo.setCurrentIndex(dialog.sender_combo.findData("Sara"))
+    assert visible_ids(dialog) == [1, 4]
+    dialog.sender_combo.setCurrentIndex(0)
+
+    dialog.ext_combo.setCurrentIndex(dialog.ext_combo.findData(".pdf"))
+    assert visible_ids(dialog) == [1, 6]
+    dialog._set_visible(Qt.Checked)                  # tick the two PDFs
+    dialog.ext_combo.setCurrentIndex(0)
+
+    dialog.max_check.setChecked(True)
+    dialog.max_size.setValue(100)                    # MB: hides the 300 MB video
+    assert 4 not in visible_ids(dialog)
+    dialog.max_check.setChecked(False)
+
+    from PySide6.QtCore import QDate
+    dialog.since_check.setChecked(True)
+    dialog.since_date.setDate(QDate(2025, 1, 3))
+    dialog.until_check.setChecked(True)
+    dialog.until_date.setDate(QDate(2025, 1, 4))
+    assert visible_ids(dialog) == [3, 4]
+    # Ticked files stay ticked while hidden, and the summary says so.
+    assert dialog.selected_ids() == [1, 6]
+    assert "غير ظاهر" in dialog.summary.text()
+
+    dialog.reset_filters()
+    assert visible_ids(dialog) == [1, 2, 3, 4, 5, 6]   # reset shows every type
+    assert not dialog.since_date.isEnabled()
 
 
 def test_pick_files_then_download_only_those(app, tmp_path, monkeypatch, no_dialogs):
@@ -661,7 +716,7 @@ def test_pick_files_then_download_only_those(app, tmp_path, monkeypatch, no_dial
     worker.scan = lambda chat_id, options, name: scans.append((chat_id, options)) or worker._noop()
 
     class Picker:
-        def __init__(self, items, already, parent):
+        def __init__(self, items, already, parent, kinds=None):
             self.items = items
 
         def exec(self):
@@ -671,13 +726,17 @@ def test_pick_files_then_download_only_those(app, tmp_path, monkeypatch, no_dial
             return [self.items[0]["msg_id"]]
     monkeypatch.setattr(window_mod, "SelectFilesDialog", Picker)
 
+    win.config.update(kinds=["photo"], exts="zip")      # settings filters...
     win.pick_files()
     assert worker.submitted[-1] == "scan" and scans[0][1].dry_run
+    scan_filter = scans[0][1].filter                       # ...don't limit the list
+    assert scan_filter.kinds == frozenset(KINDS) and not scan_filter.exts
     assert win.stop_btn.isEnabled()
     worker.job_done.emit("scan", ([picked(9)], Stats(queued=1)))
     _, chat_id, opts = worker.calls[-1]
     assert worker.submitted[-1] == "download"
     assert chat_id == 42 and opts.ids == [9] and not opts.dry_run
+    assert opts.filter.kinds == frozenset(KINDS) and not opts.filter.exts
 
     win._job_finished()
     win.pick_files()
@@ -724,3 +783,13 @@ def test_wait_countdown_during_download(app, tmp_path):
     win._tick_wait()
     assert win.current_label.text() == "" and not win.wait_timer.isActive()
     win.close()
+
+
+def test_build_options_everything_ignores_filters():
+    from tgdl.gui.settings import build_options
+    opts = build_options({"kinds": [], "exts": "pdf", "senders": "x", "since_on": True,
+                          "since": "2025-01-01", "max_on": True, "naming": "numbers"},
+                         everything=True)
+    assert opts.filter.kinds == frozenset(KINDS)
+    assert not opts.filter.exts and not opts.filter.senders and opts.filter.max_size is None
+    assert opts.since is None and opts.naming == "numbers"     # saving options kept

@@ -82,9 +82,16 @@ def folder_template(p):
     return template
 
 
-def build_options(config, preview=False):
-    """Options for a download from the saved preferences; ValueError explains a problem."""
+def build_options(config, preview=False, everything=False):
+    """Options for a download from the saved preferences; ValueError explains a problem.
+
+    ``everything`` keeps where and how files are saved but drops the filters:
+    used to list a chat's files for the picker, and to download hand-picked ones.
+    """
     p = prefs(config)
+    if everything:
+        p.update(kinds=list(KINDS), exts="", senders="", since_on=False, until_on=False,
+                 max_on=False)
     if not p["kinds"]:
         raise ValueError("اختر نوعاً واحداً من الملفات على الأقل (الإعدادات ← الملفات).")
     since = until = None

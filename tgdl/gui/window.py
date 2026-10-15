@@ -9,10 +9,10 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
+    QDialog, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
     QProgressBar, QProgressDialog, QPushButton, QSizePolicy, QSplitter, QStackedWidget,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+    QVBoxLayout, QWidget)
 from telethon import errors as tg_errors
 
 from .. import __version__
@@ -21,6 +21,7 @@ from .config import (Config, chat_cache_age, clear_chat_cache, load_chat_cache,
                      save_chat_cache, session_path)
 from .settings import (TAB_ACCOUNT, TAB_FILES, SettingsDialog, build_options, default_out_dir,
                        prefs, summary)
+from .picker import SelectFilesDialog, size_ar
 from .theme import avatar_pixmap, set_kind
 from .widgets import (CHAT_ID_ROLE, CHAT_KIND_ROLE, CHAT_KINDS, CHAT_MARK_ROLE,
                       CHAT_TITLE_ROLE, Card, ChatDelegate, chat_subtitle)
@@ -58,17 +59,6 @@ def _dispose(widget):
     if isinstance(widget, QWidget):
         widget.setParent(None)
         widget.deleteLater()
-
-
-def size_ar(num):
-    """File size with Arabic units (Latin units get scrambled in RTL text)."""
-    if num is None:
-        return "حجم غير معروف"
-    for unit in ("بايت", "كيلوبايت", "ميغابايت"):
-        if num < 1024:
-            return f"{num:.0f} {unit}" if unit == "بايت" else f"{num:.1f} {unit}"
-        num /= 1024
-    return f"{num:.2f} غيغابايت"
 
 
 class CodeDialog(QDialog):
@@ -122,146 +112,6 @@ class CodeDialog(QDialog):
     def _resend(self):
         self.result_value = RESEND
         self.accept()
-
-
-KIND_LABELS = {
-    "photo": "صورة", "video": "فيديو", "document": "ملف", "audio": "صوت",
-    "voice": "رسالة صوتية", "video_note": "فيديو دائري", "gif": "GIF", "sticker": "ملصق",
-}
-SORT_ROLE = Qt.UserRole
-ID_ROLE = Qt.UserRole + 1
-SEARCH_ROLE = Qt.UserRole + 2
-
-
-class _FileRow(QTreeWidgetItem):
-    """Sorts by the raw value (bytes, timestamp) rather than the shown text."""
-
-    def __lt__(self, other):
-        column = self.treeWidget().sortColumn() if self.treeWidget() else 0
-        mine, theirs = self.data(column, SORT_ROLE), other.data(column, SORT_ROLE)
-        if mine is not None and theirs is not None:
-            return mine < theirs
-        return self.text(column) < other.text(column)
-
-
-class SelectFilesDialog(QDialog):
-    """Lists the files a download would fetch; the user ticks the ones wanted."""
-
-    COLUMNS = ["الملف", "المرسل", "النوع", "الحجم", "التاريخ"]
-
-    def __init__(self, items, already=0, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("اختر الملفات المطلوب تنزيلها")
-        self.resize(860, 580)
-
-        intro = f"وُجد {len(items)} ملف جديد في هذه المحادثة حسب اختياراتك. ضع علامة ✔ على ما تريد تنزيله."
-        if already:
-            intro += f"\n({already} ملف منزّل مسبقاً لا يظهر هنا.)"
-        intro_label = QLabel(intro)
-        intro_label.setWordWrap(True)
-
-        self.search = QLineEdit(placeholderText="ابحث باسم الملف أو المرسل أو النوع...")
-        self.search.setClearButtonEnabled(True)
-        self.search.textChanged.connect(self._filter)
-
-        self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(self.COLUMNS)
-        self.tree.setRootIsDecorated(False)
-        self.tree.setUniformRowHeights(True)
-        self.tree.setAlternatingRowColors(True)
-        for i, item in enumerate(items):
-            name = item.get("file_name") or Path(item["path"]).name
-            kind = KIND_LABELS.get(item.get("kind"), item.get("kind") or "")
-            date = item.get("date")
-            row = _FileRow([
-                f"\u2068{name}\u2069",
-                f"\u2068{item.get('sender') or ''}\u2069",
-                kind,
-                size_ar(item.get("size")),
-                f"{date:%Y/%m/%d %H:%M}" if date else "",
-            ])
-            row.setFlags(row.flags() | Qt.ItemIsUserCheckable)
-            row.setCheckState(0, Qt.Unchecked)
-            row.setData(0, ID_ROLE, item["msg_id"])
-            row.setData(0, SEARCH_ROLE, f"{name} {item.get('sender') or ''} {kind}".casefold())
-            row.setData(0, SORT_ROLE, name.casefold())
-            row.setData(1, SORT_ROLE, (item.get("sender") or "").casefold())
-            row.setData(2, SORT_ROLE, kind)
-            row.setData(3, SORT_ROLE, item.get("size") or 0)
-            row.setData(4, SORT_ROLE, date.timestamp() if date else 0.0)
-            self.tree.addTopLevelItem(row)
-        self.tree.setSortingEnabled(True)
-        self.tree.sortByColumn(4, Qt.AscendingOrder)       # oldest first, like the chat
-        # Fit the columns once; a live ResizeToContents mode keeps measuring
-        # rows and has crashed while Qt tears the dialog down.
-        header = self.tree.header()
-        for column in range(1, len(self.COLUMNS)):
-            self.tree.resizeColumnToContents(column)
-        header.setStretchLastSection(False)
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
-        self.tree.itemChanged.connect(self._update_summary)
-        self.tree.itemDoubleClicked.connect(self._toggle)
-
-        select_all = QPushButton("تحديد الكل")
-        select_all.clicked.connect(lambda: self._set_visible(Qt.Checked))
-        select_none = QPushButton("إلغاء التحديد")
-        select_none.clicked.connect(lambda: self._set_visible(Qt.Unchecked))
-        self.summary = QLabel()
-        tools = QHBoxLayout()
-        tools.addWidget(select_all)
-        tools.addWidget(select_none)
-        tools.addStretch(1)
-        tools.addWidget(self.summary)
-
-        buttons = QDialogButtonBox()
-        self.ok_btn = set_kind(buttons.addButton("تنزيل المحدد", QDialogButtonBox.AcceptRole),
-                               "primary")
-        self.ok_btn.setDefault(True)
-        buttons.addButton("إلغاء", QDialogButtonBox.RejectRole)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(intro_label)
-        layout.addWidget(self.search)
-        layout.addWidget(self.tree, 1)
-        layout.addLayout(tools)
-        layout.addWidget(buttons)
-        self._update_summary()
-
-    def _rows(self):
-        return [self.tree.topLevelItem(i) for i in range(self.tree.topLevelItemCount())]
-
-    def _filter(self, text):
-        needle = text.strip().casefold()
-        for row in self._rows():
-            row.setHidden(bool(needle) and needle not in row.data(0, SEARCH_ROLE))
-
-    def _set_visible(self, state):
-        self.tree.blockSignals(True)         # one summary update, not one per row
-        for row in self._rows():
-            if not row.isHidden():
-                row.setCheckState(0, state)
-        self.tree.blockSignals(False)
-        self._update_summary()
-
-    def _toggle(self, row, _column):
-        checked = row.checkState(0) == Qt.Checked
-        row.setCheckState(0, Qt.Unchecked if checked else Qt.Checked)
-
-    def _update_summary(self, *_):
-        count = total = 0
-        for row in self._rows():
-            if row.checkState(0) == Qt.Checked:
-                count += 1
-                total += row.data(3, SORT_ROLE) or 0
-        self.summary.setText(f"المحدد: {count} ملف ({size_ar(total)})")
-        self.ok_btn.setText(f"تنزيل المحدد ({count})")
-        self.ok_btn.setEnabled(count > 0)
-
-    def selected_ids(self):
-        return sorted(row.data(0, ID_ROLE) for row in self._rows()
-                      if row.checkState(0) == Qt.Checked)
 
 
 class LoginMethodDialog(QDialog):
@@ -937,9 +787,9 @@ class MainWindow(QMainWindow):
 
     # -- downloading --------------------------------------------------------
 
-    def _collect_options(self, preview):
+    def _collect_options(self, preview, everything=False):
         try:
-            return build_options(self.config, preview)
+            return build_options(self.config, preview, everything=everything)
         except ValueError as e:
             QMessageBox.warning(self, APP_TITLE, str(e))
             return None
@@ -964,7 +814,8 @@ class MainWindow(QMainWindow):
         chat = chat or self._current_chat()
         if chat is None:
             return
-        options = self._collect_options(preview)
+        # Hand-picked files are downloaded as picked, whatever the filters say.
+        options = self._collect_options(preview, everything=bool(ids))
         if options is None:
             return
         options.ids = ids
@@ -981,7 +832,8 @@ class MainWindow(QMainWindow):
         chat = self._current_chat()
         if chat is None:
             return
-        options = self._collect_options(preview=True)
+        # List every file; the picker's own filters narrow it down.
+        options = self._collect_options(preview=True, everything=True)
         if options is None:
             return
         self.pick_chat = chat
@@ -1000,7 +852,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "اختيار الملفات", msg)
             return
         self.current_label.setText(f"وُجد {len(items)} ملف. اختر ما تريد تنزيله.")
-        dialog = SelectFilesDialog(items, stats.skipped, self)
+        dialog = SelectFilesDialog(items, stats.skipped, self, kinds=prefs(self.config)["kinds"])
         accepted = dialog.exec() == QDialog.Accepted
         ids = dialog.selected_ids() if accepted else []
         _dispose(dialog)
