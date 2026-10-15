@@ -7,9 +7,9 @@ from pathlib import Path
 from PySide6.QtCore import QDate, QStandardPaths, Qt
 from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
-    QSpinBox, QTabWidget, QVBoxLayout, QWidget)
+    QButtonGroup, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QDoubleSpinBox,
+    QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+    QPushButton, QRadioButton, QScrollArea, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
 from .. import __version__
 from ..downloader import Options
@@ -38,7 +38,7 @@ NAMING_CHOICES = [
     ("numbers", "أرقام متسلسلة 1، 2، 3… (ترقيم منفصل لكل نوع)"),
 ]
 
-TAB_FILES, TAB_SAVING, TAB_ACCOUNT, TAB_ABOUT = range(4)
+TAB_FILES, TAB_SAVING, TAB_AUTO, TAB_PRINT, TAB_ACCOUNT, TAB_ABOUT = range(6)
 
 
 def default_out_dir():
@@ -70,6 +70,14 @@ def prefs(config):
         "chat_folder": bool(config.get("chat_folder", True)),
         "type_folder": bool(config.get("type_folder", False)),
         "naming": config.get("naming", "original"),
+        "day_folder": bool(config.get("day_folder", False)),
+        "auto_receive": bool(config.get("auto_receive", False)),
+        "auto_scope": config.get("auto_scope", "private"),
+        "auto_chats": [int(c) for c in config.get("auto_chats", []) if str(c).lstrip("-").isdigit()],
+        "auto_sound": bool(config.get("auto_sound", True)),
+        "keep_running": bool(config.get("keep_running", True)),
+        "price": float(config.get("price", 0) or 0),
+        "currency": config.get("currency", ""),
         "auto_delete": bool(config.get("auto_delete", False)),
         "delete_after": int(config.get("delete_after", 15)),
     }
@@ -79,6 +87,8 @@ def folder_template(p):
     template = "{sender}"
     if p["chat_folder"]:
         template = "{chat}/" + template
+    if p.get("day_folder"):
+        template = "{day}/" + template
     if p["type_folder"]:
         template += "/{type}"
     return template
@@ -122,6 +132,20 @@ def build_options(config, preview=False, everything=False):
     )
 
 
+def short_summary(config):
+    """One line for the main window: what is downloaded and where it goes."""
+    lines = dict(summary(config))
+    text = f"{lines['الأنواع']} ← {lines['الحفظ في']}"
+    if lines["التصفية"] != "بدون":
+        text += f"  (مع تصفية: {lines['التصفية']})"
+    return text
+
+
+def format_money(amount, currency=""):
+    text = f"{amount:,.2f}".rstrip("0").rstrip(".")
+    return f"{text} {currency}".strip()
+
+
 def summary(config):
     """Short Arabic lines describing the preferences, for the main window."""
     p = prefs(config)
@@ -144,6 +168,8 @@ def summary(config):
     if p["max_on"]:
         filters.append(f"أصغر من {p['max_mb']} ميغابايت")
     parts = ["⁨" + p["out_dir"] + "⁩"]
+    if p["day_folder"]:
+        parts.append("اليوم")
     if p["chat_folder"]:
         parts.append("المحادثة")
     parts.append("المرسل")
@@ -175,9 +201,11 @@ class SettingsDialog(QDialog):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._scroll(self._files_tab(p)), "الملفات")
-        self.tabs.addTab(self._scroll(self._saving_tab(p)), "الحفظ والتسمية")
-        self.tabs.addTab(self._scroll(self._account_tab()), "حساب تليكرام")
-        self.tabs.addTab(self._scroll(self._about_tab(on_check_updates)), "حول البرنامج")
+        self.tabs.addTab(self._scroll(self._saving_tab(p)), "الحفظ")
+        self.tabs.addTab(self._scroll(self._auto_tab(p)), "الاستقبال")
+        self.tabs.addTab(self._scroll(self._print_tab(p)), "الطباعة")
+        self.tabs.addTab(self._scroll(self._account_tab()), "الحساب")
+        self.tabs.addTab(self._scroll(self._about_tab(on_check_updates)), "حول")
         self.tabs.setCurrentIndex(tab)
 
         buttons = QDialogButtonBox()
@@ -300,6 +328,9 @@ class SettingsDialog(QDialog):
                                            checked=p["type_folder"])
         layout.addWidget(self.chat_folder_check)
         layout.addWidget(self.type_folder_check)
+        self.day_folder_check = QCheckBox("مجلد لكل يوم (حسب تاريخ الإرسال) قبل مجلد المحادثة",
+                                          checked=p["day_folder"])
+        layout.addWidget(self.day_folder_check)
 
         layout.addSpacing(6)
         layout.addLayout(self._title(
@@ -334,9 +365,59 @@ class SettingsDialog(QDialog):
         delete_row.addStretch(1)
         layout.addLayout(delete_row)
         for signal in (self.out_edit.textChanged, self.chat_folder_check.toggled,
-                       self.type_folder_check.toggled, self.naming_combo.currentIndexChanged):
+                       self.type_folder_check.toggled, self.naming_combo.currentIndexChanged,
+                       self.day_folder_check.toggled):
             signal.connect(self._update_example)
         self._update_example()
+        layout.addStretch(1)
+        return page
+
+    def _auto_tab(self, p):
+        page, layout = self._page()
+        layout.addLayout(self._title(
+            "الاستقبال التلقائي",
+            "ينزّل البرنامج كل ملف جديد يصلك فوراً، في مجلد باسم مرسله، ويُعلمك بإشعار. "
+            "يعمل ما دام البرنامج مفتوحاً، ويتبع أنواع الملفات المختارة في تبويب «الملفات»."))
+        self.auto_check = QCheckBox("تشغيل الاستقبال التلقائي", checked=p["auto_receive"])
+        layout.addWidget(self.auto_check)
+        self.scope_private = QRadioButton("من كل المحادثات الخاصة (الزبائن)")
+        self.scope_selected = QRadioButton(
+            "من المحادثات التي أختارها فقط (افتح المحادثة وفعّل «استقبال تلقائي» فيها)")
+        group = QButtonGroup(self)
+        group.addButton(self.scope_private)
+        group.addButton(self.scope_selected)
+        (self.scope_selected if p["auto_scope"] == "selected" else self.scope_private).setChecked(True)
+        layout.addWidget(self.scope_private)
+        layout.addWidget(self.scope_selected)
+        layout.addSpacing(6)
+        self.sound_check = QCheckBox("صوت تنبيه عند وصول ملفات", checked=p["auto_sound"])
+        self.keep_check = QCheckBox("إبقاء البرنامج يعمل بجانب الساعة عند إغلاق النافذة "
+                                    "(إذا كان الاستقبال التلقائي يعمل)", checked=p["keep_running"])
+        layout.addWidget(self.sound_check)
+        layout.addWidget(self.keep_check)
+        layout.addStretch(1)
+        return page
+
+    def _print_tab(self, p):
+        page, layout = self._page()
+        layout.addLayout(self._title(
+            "سعر الطباعة",
+            "يُستخدم لحساب مبلغ كل طلب: عدد الصفحات × سعر الصفحة. اتركه 0 إذا لا تريد حساب المبلغ."))
+        self.price_edit = QDoubleSpinBox(minimum=0, maximum=10_000_000, decimals=2)
+        self.price_edit.setValue(p["price"])
+        self.currency_edit = QLineEdit(p["currency"], placeholderText="مثال: د.ع")
+        form = QFormLayout()
+        form.setSpacing(10)
+        form.addRow("سعر الصفحة:", self.price_edit)
+        form.addRow("العملة:", self.currency_edit)
+        layout.addLayout(form)
+        layout.addSpacing(8)
+        note = QLabel("عند الطباعة تظهر نافذة ويندوز لاختيار الطابعة وعدد النسخ والألوان. "
+                      "الصور وملفات PDF تُطبع بالترتيب، وكل صفحة باتجاهها الأصلي دون أي تعديل. "
+                      "ملفات الوورد والإكسل تُطبع ببرامجها المثبتة على الجهاز.")
+        note.setProperty("muted", True)
+        note.setWordWrap(True)
+        layout.addWidget(note)
         layout.addStretch(1)
         return page
 
@@ -390,6 +471,8 @@ class SettingsDialog(QDialog):
 
     def _update_example(self):
         parts = [self.out_edit.text().strip() or "..."]
+        if self.day_folder_check.isChecked():
+            parts.append(Date.today().isoformat())
         if self.chat_folder_check.isChecked():
             parts.append("اسم المحادثة")
         parts.append("اسم المرسل")
@@ -434,6 +517,13 @@ class SettingsDialog(QDialog):
             type_folder=self.type_folder_check.isChecked(),
             naming=self.naming_combo.currentData(),
             auto_delete=self.delete_check.isChecked(),
+            day_folder=self.day_folder_check.isChecked(),
+            auto_receive=self.auto_check.isChecked(),
+            auto_scope="selected" if self.scope_selected.isChecked() else "private",
+            auto_sound=self.sound_check.isChecked(),
+            keep_running=self.keep_check.isChecked(),
+            price=self.price_edit.value(),
+            currency=self.currency_edit.text().strip(),
             delete_after=self.delete_after.value(),
         )
         try:

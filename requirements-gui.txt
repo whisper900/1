@@ -3,3 +3,5 @@
 PySide6-Essentials>=6.5
 # QR codes for logging in without an SMS code.
 segno>=1.5
+# Reading PDFs: page counts for prices, and printing (about 4 MB).
+pypdfium2>=4.30

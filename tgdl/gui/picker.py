@@ -1,10 +1,11 @@
 """The "pick files" window: every new file of a chat, with filters and ticks."""
 
 from collections import Counter
-from datetime import date as Date
+from datetime import date as Date, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import QDate, Qt
+from PySide6.QtCore import QDate, QSize, Qt
+from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QGridLayout, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QPushButton, QSpinBox, QTreeWidget, QTreeWidgetItem,
@@ -179,8 +180,12 @@ class SelectFilesDialog(QDialog):
             dates.addWidget(edit)
             dates.addSpacing(10)
         dates.addStretch(1)
+        for label, days in (("الكل", None), ("اليوم", 0), ("أمس", 1), ("آخر 7 أيام", 6)):
+            quick = set_kind(QPushButton(label), "ghost")
+            quick.clicked.connect(lambda _=False, d=days, l=label: self.quick_range(d, l))
+            dates.addWidget(quick)
         grid.addWidget(QLabel("الفترة:"), 1, 0)
-        grid.addLayout(dates, 1, 1)
+        grid.addLayout(dates, 1, 1, 1, 3)
 
         self.max_check = QCheckBox("أصغر من")
         self.max_size = QSpinBox(minimum=1, maximum=4000, value=100, suffix=" ميغابايت")
@@ -192,8 +197,8 @@ class SelectFilesDialog(QDialog):
         size_row.addWidget(self.max_check)
         size_row.addWidget(self.max_size)
         size_row.addStretch(1)
-        grid.addWidget(QLabel("الحجم:"), 1, 2)
-        grid.addLayout(size_row, 1, 3)
+        grid.addWidget(QLabel("الحجم:"), 2, 0)
+        grid.addLayout(size_row, 2, 1)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(3, 1)
         card.body.addLayout(grid)
@@ -219,6 +224,7 @@ class SelectFilesDialog(QDialog):
         self.tree.setRootIsDecorated(False)
         self.tree.setUniformRowHeights(True)
         self.tree.setAlternatingRowColors(True)
+        self.tree.setIconSize(QSize(40, 40))
         for item in items:
             kind = item.get("kind")
             kind_label = KIND_LABELS.get(kind, kind or "")
@@ -235,6 +241,10 @@ class SelectFilesDialog(QDialog):
             ])
             row.setFlags(row.flags() | Qt.ItemIsUserCheckable)
             row.setCheckState(0, Qt.Unchecked)
+            if item.get("thumb"):
+                pixmap = QPixmap()
+                if pixmap.loadFromData(item["thumb"]):
+                    row.setIcon(0, QIcon(pixmap))
             row.setData(0, ID_ROLE, item["msg_id"])
             row.setData(0, SEARCH_ROLE, f"{name} {sender}".casefold())
             row.setData(0, KIND_ROLE, kind)
@@ -286,6 +296,28 @@ class SelectFilesDialog(QDialog):
                     and (not needle or needle in row.data(0, SEARCH_ROLE)))
             row.setHidden(not show)
         self._update_summary()
+
+    def quick_range(self, days_back, label=""):
+        """«اليوم» / «أمس» / «آخر 7 أيام» / «الكل»."""
+        widgets = (self.since_check, self.until_check, self.since_date, self.until_date)
+        for widget in widgets:
+            widget.blockSignals(True)
+        if days_back is None:
+            self.since_check.setChecked(False)
+            self.until_check.setChecked(False)
+        else:
+            today = Date.today()
+            start = today - timedelta(days=days_back)
+            end = start if days_back == 1 else today
+            self.since_date.setDate(QDate(start.year, start.month, start.day))
+            self.until_date.setDate(QDate(end.year, end.month, end.day))
+            self.since_check.setChecked(True)
+            self.until_check.setChecked(True)
+        self.since_date.setEnabled(self.since_check.isChecked())
+        self.until_date.setEnabled(self.until_check.isChecked())
+        for widget in widgets:
+            widget.blockSignals(False)
+        self._apply_filters()
 
     def reset_filters(self):
         widgets = [*self.kind_chips.values(), self.sender_combo, self.ext_combo,

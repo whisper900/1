@@ -6,25 +6,30 @@ import sys
 import time as clock
 from pathlib import Path
 
+import os
+
 from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QPixmap
+from PySide6.QtGui import QDesktopServices, QIcon, QImage, QImageReader, QPainter, QPixmap
+from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel,
-    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
-    QProgressBar, QProgressDialog, QPushButton, QSizePolicy, QSplitter, QStackedWidget,
-    QVBoxLayout, QWidget)
+    QApplication, QCheckBox, QDialog, QDialogButtonBox, QFrame, QHBoxLayout, QInputDialog,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+    QPlainTextEdit, QProgressBar, QProgressDialog, QPushButton, QSplitter, QStackedWidget,
+    QSystemTrayIcon, QToolButton, QVBoxLayout, QWidget)
 from telethon import errors as tg_errors
 
 from .. import __version__
-from . import cleanup, updater
-from .config import (Config, chat_cache_age, clear_chat_cache, load_chat_cache,
+from ..pdfmerge import merge_images
+from . import cleanup, printing, updater
+from .config import (Config, app_dir, chat_cache_age, clear_chat_cache, load_chat_cache,
                      save_chat_cache, session_path)
-from .settings import (TAB_ACCOUNT, TAB_FILES, SettingsDialog, build_options, default_out_dir,
-                       prefs, summary)
+from .orders import OrderBook, group_of, summarize
+from .settings import (TAB_ACCOUNT, TAB_FILES, SettingsDialog, build_options,
+                       default_out_dir, format_money, prefs, short_summary)
 from .picker import SelectFilesDialog, size_ar
 from .theme import avatar_pixmap, set_kind
-from .widgets import (CHAT_ID_ROLE, CHAT_KIND_ROLE, CHAT_KINDS, CHAT_MARK_ROLE,
-                      CHAT_TITLE_ROLE, Card, ChatDelegate, chat_subtitle)
+from .widgets import (CHAT_BADGE_ROLE, CHAT_ID_ROLE, CHAT_KIND_ROLE, CHAT_KINDS,
+                      CHAT_MARK_ROLE, CHAT_TITLE_ROLE, Card, ChatDelegate, chat_subtitle)
 from .worker import RESEND, LoginCancelled, TelegramWorker, friendly_error
 
 APP_TITLE = "منزّل ملفات تليكرام"
@@ -52,6 +57,26 @@ ASK_TEXT = {
               "اكتب بريدك الإلكتروني، وسيرسل تليكرام إليه كود تأكيد:"),
 }
 CODE_TITLES = {"code": "كود الدخول", "email_code": "كود تأكيد البريد"}
+
+
+def qimage_pixels(path):
+    """Decoded RGB pixels for images a PDF can't hold as they are (PNG with
+    transparency, WebP...). Shown the way phones show them, on white paper."""
+    reader = QImageReader(str(path))
+    reader.setAutoTransform(True)
+    image = reader.read()
+    if image.isNull():
+        return None
+    canvas = QImage(image.size(), QImage.Format_RGB888)
+    canvas.fill(Qt.white)
+    painter = QPainter(canvas)
+    painter.drawImage(0, 0, image)
+    painter.end()
+    width, height, line = canvas.width(), canvas.height(), canvas.bytesPerLine()
+    data = bytes(canvas.constBits())
+    if line != width * 3:            # drop the padding at the end of each row
+        data = b"".join(data[row * line:row * line + width * 3] for row in range(height))
+    return width, height, data
 
 
 def _dispose(widget):
@@ -204,6 +229,13 @@ class MainWindow(QMainWindow):
         self.wait_timer = QTimer(self, interval=1000)
         self.wait_timer.timeout.connect(self._tick_wait)
         self.updater = updater.Updater()
+        self.orders_path = None      # None = the app's settings folder
+        self.run_chat = None         # (chat id, name) of the running download
+        self.auto_out_dir = None
+        self.tray = None
+        self._quitting = False
+        self._tray_hint_shown = False
+        self._page_cache = {}
 
         self.setWindowTitle(f"{APP_TITLE} — الإصدار {__version__}")
         self.resize(1100, 740)
@@ -220,6 +252,8 @@ class MainWindow(QMainWindow):
         self.worker.qr.connect(self._on_qr)
         self.worker.chats_partial.connect(self._on_chats_partial)
         self.worker.flood_wait.connect(self._on_flood_wait)
+        self.worker.auto_event.connect(self._on_auto_event)
+        self.worker.auto_done.connect(self._on_auto_done)
         self.updater.checked.connect(self._on_update_checked)
         self.updater.check_failed.connect(self._on_update_check_failed)
 
@@ -235,6 +269,7 @@ class MainWindow(QMainWindow):
         self.cleanup_timer.start()
 
         if autostart:
+            self._setup_tray()
             QTimer.singleShot(0, self._cleanup_tick)
             QTimer.singleShot(0, self._first_start)
 
@@ -271,29 +306,34 @@ class MainWindow(QMainWindow):
         icon = self.windowIcon().pixmap(30, 30)
         if not icon.isNull():
             logo.setPixmap(icon)
-        title = QLabel(APP_TITLE, objectName="appTitle")
-        version = QLabel(f"الإصدار {__version__}", objectName="version")
         row.addWidget(logo)
-        row.addWidget(title)
-        row.addWidget(version)
+        row.addWidget(QLabel(APP_TITLE, objectName="appTitle"))
+        row.addWidget(QLabel(f"الإصدار {__version__}", objectName="version"))
         row.addStretch(1)
 
+        self.auto_btn = QPushButton(checkable=True)
+        self.auto_btn.setProperty("chip", True)
+        self.auto_btn.setToolTip("ينزّل الملفات الجديدة فور وصولها، في مجلد باسم مرسلها")
+        self.auto_btn.toggled.connect(self._toggle_auto)
         self.account_avatar = QLabel()
         self.account_label = QLabel("غير مسجّل الدخول")
         self.account_label.setStyleSheet("font-weight: 600;")
+        self.account_btn = QToolButton(text="▾", popupMode=QToolButton.InstantPopup)
+        self.account_btn.setAutoRaise(True)
+        menu = QMenu(self.account_btn)
+        self.update_action = menu.addAction("التحقق من التحديثات")
+        self.update_action.triggered.connect(lambda: self.check_updates(manual=True))
+        self.logout_action = menu.addAction("تسجيل الخروج")
+        self.logout_action.triggered.connect(self.logout)
+        self.account_btn.setMenu(menu)
         self.login_btn = set_kind(QPushButton("تسجيل الدخول"), "primary")
         self.login_btn.clicked.connect(self.login)
-        self.logout_btn = set_kind(QPushButton("خروج"), "ghost")
-        self.logout_btn.setToolTip("تسجيل الخروج من الحساب")
-        self.logout_btn.clicked.connect(self.logout)
-        self.update_btn = set_kind(QPushButton("التحديثات"), "ghost")
-        self.update_btn.setToolTip("التحقق من وجود إصدار أحدث")
-        self.update_btn.clicked.connect(lambda: self.check_updates(manual=True))
         self.settings_btn = QPushButton("⚙  الإعدادات")
         self.settings_btn.clicked.connect(lambda: self.open_settings())
-        for widget in (self.account_avatar, self.account_label, self.login_btn,
-                       self.logout_btn, self.update_btn, self.settings_btn):
+        for widget in (self.auto_btn, self.account_avatar, self.account_label, self.account_btn,
+                       self.login_btn, self.settings_btn):
             row.addWidget(widget)
+        self._show_auto_state()
         return header
 
     def _build_sidebar(self):
@@ -323,10 +363,23 @@ class MainWindow(QMainWindow):
         self.chats_status = QLabel(objectName="status")
         self.chats_status.setWordWrap(True)
 
+        self.cleanup_label = QLabel(objectName="status")
+        self.cleanup_label.setWordWrap(True)
+        self.delete_now_btn = set_kind(QPushButton("احذفها الآن"), "ghost")
+        self.delete_now_btn.clicked.connect(self.delete_scheduled_now)
+        cleanup_row = QHBoxLayout()
+        cleanup_row.setContentsMargins(6, 0, 6, 0)
+        cleanup_row.addWidget(self.cleanup_label, 1)
+        cleanup_row.addWidget(self.delete_now_btn)
+        self.cleanup_row = QWidget()
+        self.cleanup_row.setLayout(cleanup_row)
+        self.cleanup_row.hide()
+
         card.body.addLayout(title_row)
         card.body.addWidget(self.chat_search)
         card.body.addWidget(self.chat_list, 1)
         card.body.addWidget(self.chats_status)
+        card.body.addWidget(self.cleanup_row)
         return card
 
     def _build_main(self):
@@ -360,8 +413,8 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
 
-        # Selected chat and what will happen
-        head = Card(margins=(18, 16, 18, 16), spacing=14)
+        # 1. The chat and the two ways to get its files
+        head = Card(margins=(18, 16, 18, 14), spacing=12)
         top = QHBoxLayout()
         top.setSpacing(12)
         self.chat_avatar = QLabel()
@@ -372,56 +425,46 @@ class MainWindow(QMainWindow):
         self.chat_kind.setProperty("muted", True)
         names.addWidget(self.chat_name)
         names.addWidget(self.chat_kind)
+        self.chat_auto_check = QCheckBox("📥 استقبال تلقائي لهذه المحادثة")
+        self.chat_auto_check.toggled.connect(self._on_chat_auto_toggled)
+        self.chat_auto_label = QLabel("📥 تُستقبل ملفاتها تلقائياً", objectName="status")
         top.addWidget(self.chat_avatar)
         top.addLayout(names, 1)
+        top.addWidget(self.chat_auto_check)
+        top.addWidget(self.chat_auto_label)
         head.body.addLayout(top)
-
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setStyleSheet("color: #E3E7EE;")
-        head.body.addWidget(line)
-
-        settings_row = QHBoxLayout()
-        settings_row.addWidget(QLabel("إعدادات التنزيل", objectName="sectionTitle"))
-        settings_row.addStretch(1)
-        edit = set_kind(QPushButton("تعديل"), "ghost")
-        edit.clicked.connect(lambda: self.open_settings(TAB_FILES))
-        settings_row.addWidget(edit)
-        head.body.addLayout(settings_row)
-        self.summary_grid = QGridLayout()
-        self.summary_grid.setHorizontalSpacing(14)
-        self.summary_grid.setVerticalSpacing(6)
-        self.summary_grid.setColumnStretch(1, 1)
-        head.body.addLayout(self.summary_grid)
 
         actions = QHBoxLayout()
         actions.setSpacing(8)
-        self.start_btn = set_kind(QPushButton("⬇  تنزيل كل الملفات"), "primary")
+        self.start_btn = set_kind(QPushButton("⬇  تنزيل الملفات الجديدة"), "primary")
         self.start_btn.setDefault(True)
+        self.start_btn.setToolTip("ينزّل كل ملف لم يُنزَّل بعد من هذه المحادثة")
         self.start_btn.clicked.connect(lambda: self.start(preview=False))
-        self.pick_btn = QPushButton("☑  اختيار ملفات محددة")
-        self.pick_btn.setToolTip("يعرض قائمة الملفات في المحادثة لتختار منها ما تريد تنزيله فقط")
+        self.pick_btn = QPushButton("☑  اختيار ملفات")
+        self.pick_btn.setToolTip("يعرض ملفات المحادثة لتختار منها ما تريد فقط")
         self.pick_btn.clicked.connect(self.pick_files)
-        self.preview_btn = set_kind(QPushButton("معاينة"), "ghost")
-        self.preview_btn.setToolTip("يحسب عدد الملفات وحجمها بدون تنزيل")
-        self.preview_btn.clicked.connect(lambda: self.start(preview=True))
         actions.addWidget(self.start_btn)
         actions.addWidget(self.pick_btn)
-        actions.addWidget(self.preview_btn)
         actions.addStretch(1)
         head.body.addLayout(actions)
+
+        settings_row = QHBoxLayout()
+        self.settings_line = QLabel(objectName="status")
+        self.settings_line.setWordWrap(True)
+        change = set_kind(QPushButton("تغيير"), "ghost")
+        change.clicked.connect(lambda: self.open_settings(TAB_FILES))
+        settings_row.addWidget(self.settings_line, 1)
+        settings_row.addWidget(change, 0, Qt.AlignTop)
+        head.body.addLayout(settings_row)
         layout.addWidget(head)
 
-        # Progress
-        progress_card = Card(margins=(18, 14, 18, 14), spacing=8)
+        # 2. Progress of the running download
+        self.progress_card = Card(margins=(18, 14, 18, 14), spacing=8)
         progress_top = QHBoxLayout()
-        progress_top.addWidget(QLabel("التقدّم", objectName="sectionTitle"))
+        progress_top.addWidget(QLabel("التنزيل", objectName="sectionTitle"))
         progress_top.addStretch(1)
-        self.open_btn = set_kind(QPushButton("📂 فتح مجلد التنزيلات"), "ghost")
-        self.open_btn.clicked.connect(self.open_out_dir)
         self.stop_btn = set_kind(QPushButton("■  إيقاف"), "danger")
         self.stop_btn.clicked.connect(self.stop)
-        progress_top.addWidget(self.open_btn)
         progress_top.addWidget(self.stop_btn)
         self.current_label = QLabel(" ")
         self.current_label.setWordWrap(True)
@@ -430,23 +473,6 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.stats_label = QLabel(" ", objectName="status")
         self.stats_label.setWordWrap(True)
-        self.cleanup_label = QLabel(objectName="status")
-        self.cleanup_label.setWordWrap(True)
-        self.delete_now_btn = set_kind(QPushButton("احذفها الآن"), "ghost")
-        self.delete_now_btn.clicked.connect(self.delete_scheduled_now)
-        cleanup_row = QHBoxLayout()
-        cleanup_row.addWidget(self.cleanup_label, 1)
-        cleanup_row.addWidget(self.delete_now_btn)
-        self.cleanup_row = QWidget()
-        self.cleanup_row.setLayout(cleanup_row)
-        cleanup_row.setContentsMargins(0, 0, 0, 0)
-        self.cleanup_row.hide()
-        progress_card.body.addLayout(progress_top)
-        progress_card.body.addWidget(self.current_label)
-        progress_card.body.addWidget(self.progress)
-        progress_card.body.addWidget(self.stats_label)
-        progress_card.body.addWidget(self.cleanup_row)
-
         self.log_toggle = set_kind(QPushButton("عرض السجل ▾"), "ghost")
         self.log_toggle.setCheckable(True)
         self.log_toggle.toggled.connect(self._toggle_log)
@@ -458,9 +484,48 @@ class MainWindow(QMainWindow):
         self.log_view.document().setDefaultTextOption(option)
         self.log_view.setMinimumHeight(110)
         self.log_view.hide()
-        progress_card.body.addWidget(self.log_toggle, alignment=Qt.AlignRight)
-        progress_card.body.addWidget(self.log_view, 1)
-        layout.addWidget(progress_card)
+        for widget in (self.current_label, self.progress, self.stats_label):
+            self.progress_card.body.addWidget(widget)
+        self.progress_card.body.insertLayout(0, progress_top)
+        self.progress_card.body.addWidget(self.log_toggle, alignment=Qt.AlignRight)
+        self.progress_card.body.addWidget(self.log_view, 1)
+        self.progress_card.hide()
+        layout.addWidget(self.progress_card)
+
+        # 3. The customer's order: what was received, its price, and what to do with it
+        self.order_card = Card(margins=(18, 14, 18, 14), spacing=8)
+        order_top = QHBoxLayout()
+        self.order_title = QLabel(objectName="sectionTitle")
+        self.order_age = QLabel(objectName="status")
+        order_top.addWidget(self.order_title)
+        order_top.addStretch(1)
+        order_top.addWidget(self.order_age)
+        self.order_summary = QLabel()
+        self.order_summary.setWordWrap(True)
+        self.order_pages = QLabel()
+        self.order_pages.setWordWrap(True)
+        self.order_pages.setStyleSheet("font-weight: 600;")
+        order_actions = QHBoxLayout()
+        order_actions.setSpacing(8)
+        self.print_btn = set_kind(QPushButton("🖨  طباعة الطلب"), "primary")
+        self.print_btn.clicked.connect(self.print_order)
+        self.merge_btn = QPushButton("🧾  دمج الصور في PDF")
+        self.merge_btn.clicked.connect(self.merge_order)
+        self.open_btn = set_kind(QPushButton("📂 فتح المجلد"), "ghost")
+        self.open_btn.clicked.connect(self.open_order_folder)
+        self.deliver_btn = set_kind(QPushButton("✔ تم التسليم"), "ghost")
+        self.deliver_btn.setToolTip("ينهي طلب هذا الزبون، مع حذف ملفاته أو إبقائها")
+        self.deliver_btn.clicked.connect(self.deliver_order)
+        for button in (self.print_btn, self.merge_btn, self.open_btn):
+            order_actions.addWidget(button)
+        order_actions.addStretch(1)
+        order_actions.addWidget(self.deliver_btn)
+        self.order_card.body.addLayout(order_top)
+        self.order_card.body.addWidget(self.order_summary)
+        self.order_card.body.addWidget(self.order_pages)
+        self.order_card.body.addLayout(order_actions)
+        self.order_card.hide()
+        layout.addWidget(self.order_card)
         layout.addStretch(1)
         self.chat_page_layout = layout
         return page
@@ -470,22 +535,12 @@ class MainWindow(QMainWindow):
         self.log_toggle.setText("إخفاء السجل ▴" if shown else "عرض السجل ▾")
         # Let the progress card take the free space only while the log is open.
         self.chat_page_layout.setStretch(1, 1 if shown else 0)
-        self.chat_page_layout.setStretch(2, 0 if shown else 1)
+        self.chat_page_layout.setStretch(3, 0 if shown else 1)
 
     # -- preferences --------------------------------------------------------
 
     def _refresh_summary(self):
-        while self.summary_grid.count():
-            widget = self.summary_grid.takeAt(0).widget()
-            if widget is not None:
-                widget.deleteLater()
-        for row, (key, value) in enumerate(summary(self.config)):
-            key_label = QLabel(key, objectName="summaryKey")
-            value_label = QLabel(value)
-            value_label.setWordWrap(True)
-            value_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-            self.summary_grid.addWidget(key_label, row, 0, Qt.AlignTop)
-            self.summary_grid.addWidget(value_label, row, 1)
+        self.settings_line.setText("يُنزَّل: " + short_summary(self.config))
 
     # -- state --------------------------------------------------------------
 
@@ -497,6 +552,9 @@ class MainWindow(QMainWindow):
             self.chat_name.setText(title)
             self.chat_kind.setText(chat_subtitle(kind, item.data(CHAT_MARK_ROLE)))
             self.chat_avatar.setPixmap(avatar_pixmap(title, chat[0], 56, saved=kind == "saved"))
+            self.progress_card.setVisible(self.run_chat is not None and self.run_chat[0] == chat[0])
+            self._show_chat_auto()
+            self._refresh_order()
         self._update_state()
 
     def _update_state(self):
@@ -505,18 +563,21 @@ class MainWindow(QMainWindow):
         has_chat = self._current_chat() is not None
         self.login_btn.setVisible(False)     # the welcome page has the login button
         self.login_btn.setEnabled(not busy)
-        self.logout_btn.setVisible(self.logged_in)
-        self.logout_btn.setEnabled(not busy)
+        self.logout_action.setVisible(self.logged_in)
+        self.logout_action.setEnabled(not busy)
         self.account_avatar.setVisible(self.logged_in)
+        self.account_btn.setVisible(self.logged_in)
+        self.auto_btn.setVisible(self.logged_in)
         self.settings_btn.setEnabled(not downloading)
         self.refresh_btn.setEnabled(self.logged_in and self.chats_future is None
                                     and self.job not in ("login", "logout"))
         self.chat_list.setEnabled(self.logged_in and not downloading)
         ready = self.logged_in and has_chat and not busy
         self.start_btn.setEnabled(ready)
-        self.preview_btn.setEnabled(ready)
         self.pick_btn.setEnabled(ready)
         self.stop_btn.setEnabled(downloading)
+        for button in (self.print_btn, self.merge_btn, self.deliver_btn):
+            button.setEnabled(not downloading)
 
         if self.logged_in and (has_chat or downloading):
             self.pages.setCurrentIndex(1)
@@ -524,7 +585,7 @@ class MainWindow(QMainWindow):
             self.pages.setCurrentIndex(0)
             if self.logged_in:
                 self.empty_title.setText("اختر محادثة")
-                self.empty_text.setText("اختر محادثة من القائمة لتنزيل ملفاتها، "
+                self.empty_text.setText("اختر زبوناً من القائمة لتنزيل ملفاته، "
                                         "وكل ملف يُحفظ في مجلد باسم مرسله.")
             elif self.job == "login":
                 self.empty_title.setText("جارٍ الاتصال بتليكرام...")
@@ -572,6 +633,9 @@ class MainWindow(QMainWindow):
         _dispose(dialog)
         if accepted:
             self._refresh_summary()
+            self._apply_auto_settings()
+            self._show_chat_auto()
+            self._refresh_order()
         return accepted
 
     def login(self):
@@ -642,11 +706,11 @@ class MainWindow(QMainWindow):
                                         "التحديث التلقائي يعمل في نسخة البرنامج (exe) فقط.")
             return
         if manual:
-            self.update_btn.setEnabled(False)
+            self.update_action.setEnabled(False)
         self.updater.check(manual)
 
     def _on_update_checked(self, release, manual):
-        self.update_btn.setEnabled(True)
+        self.update_action.setEnabled(True)
         if release is None:
             if manual:
                 QMessageBox.information(self, "التحديثات",
@@ -658,7 +722,7 @@ class MainWindow(QMainWindow):
         self._offer_update(release)
 
     def _on_update_check_failed(self, message, manual):
-        self.update_btn.setEnabled(True)
+        self.update_action.setEnabled(True)
         if manual:
             QMessageBox.warning(self, "التحديثات", message)
 
@@ -732,6 +796,7 @@ class MainWindow(QMainWindow):
         """Replace the list, keeping the selected chat selected."""
         current = self.chat_list.currentItem()
         selected = current.data(Qt.UserRole) if current else None
+        badges = self._orders().counts()
         self.chat_list.clear()
         for chat_id, title, kind, mark in chats:
             label = CHAT_KINDS.get(kind, kind)
@@ -744,6 +809,7 @@ class MainWindow(QMainWindow):
             item.setData(CHAT_TITLE_ROLE, title)
             item.setData(CHAT_KIND_ROLE, kind)
             item.setData(CHAT_MARK_ROLE, mark)
+            item.setData(CHAT_BADGE_ROLE, badges.get(chat_id, 0))
             self.chat_list.addItem(item)
             if chat_id == selected:
                 self.chat_list.setCurrentItem(item)
@@ -820,8 +886,10 @@ class MainWindow(QMainWindow):
         chat_id = item.data(Qt.UserRole) if item else None
         return (chat_id, item.data(Qt.UserRole + 1)) if chat_id is not None else None
 
-    def _begin(self, job, message, coro_factory, preview):
+    def _begin(self, job, message, coro_factory, preview, chat=None):
         p = prefs(self.config)
+        self.run_chat = chat
+        self.progress_card.show()
         self.run_out_dir = Path(p["out_dir"])
         self.run_delete_after = p["delete_after"] * 60 if p["auto_delete"] else None
         self.preview = preview
@@ -849,7 +917,7 @@ class MainWindow(QMainWindow):
         else:
             message = f"بدء {'معاينة' if preview else 'تنزيل'} الملفات من: {name}"
         self._begin("preview" if preview else "download", message,
-                    lambda: self.worker.download(chat_id, options, name), preview)
+                    lambda: self.worker.download(chat_id, options, name), preview, chat)
 
     def pick_files(self):
         """Find the matching files, then let the user tick the ones to download."""
@@ -862,7 +930,7 @@ class MainWindow(QMainWindow):
             return
         self.pick_chat = chat
         self._begin("scan", f"جارٍ البحث عن الملفات في: {chat[1]}",
-                    lambda: self.worker.scan(chat[0], options, chat[1]), True)
+                    lambda: self.worker.scan(chat[0], options, chat[1]), True, chat)
 
     def _show_picker(self, result):
         self.stats_timer.stop()
@@ -927,10 +995,9 @@ class MainWindow(QMainWindow):
             self.log(f"• {self._describe(data['path'])} — {size_ar(data['size'])}")
         elif name == "saved":
             self.log(f"✔ {self._describe(data['path'])} — {size_ar(data['size'])}")
-            if self.run_delete_after and self.run_out_dir is not None:
-                cleanup.schedule(self._cleanup_store(), [self.run_out_dir / data["path"]],
-                                 self.run_delete_after, root=self.run_out_dir)
-                self._show_cleanup_status()
+            if self.run_chat is not None and self.run_out_dir is not None:
+                self._file_saved(self.run_chat[0], self.run_chat[1],
+                                 self.run_out_dir / data["path"], data, self.run_delete_after)
         elif name == "failed":
             self.log(f"✖ فشل: {self._describe(data['path'])} — {friendly_error(data['error'])}")
         elif name == "wait":
@@ -956,6 +1023,7 @@ class MainWindow(QMainWindow):
                 self._show_chats(saved)
                 self.showing_saved_chats = True
             self._update_state()
+            self._apply_auto_settings()
             if saved and age is not None and age < CHAT_REFRESH_AFTER:
                 minutes = max(1, round(age / 60))
                 self.chats_status.setText(f"القائمة محدّثة قبل {minutes} دقيقة. "
@@ -1042,6 +1110,289 @@ class MainWindow(QMainWindow):
 
     # -- closing --------------------------------------------------------------
 
+    # -- orders ---------------------------------------------------------------------
+
+    def _orders(self):
+        return OrderBook(self.orders_path or app_dir() / "orders.json")
+
+    def _file_saved(self, chat_id, chat_name, path, data, delete_after):
+        self._orders().add(chat_id, chat_name, path, data.get("kind"), data.get("msg_id"))
+        if delete_after:
+            cleanup.schedule(self._cleanup_store(), [path], delete_after,
+                             root=Path(prefs(self.config)["out_dir"]))
+            self._show_cleanup_status()
+        self._refresh_badges()
+        chat = self._current_chat()
+        if chat is not None and chat[0] == chat_id:
+            self._refresh_order()
+
+    def _refresh_badges(self):
+        counts = self._orders().counts()
+        for i in range(self.chat_list.count()):
+            item = self.chat_list.item(i)
+            chat_id = item.data(CHAT_ID_ROLE)
+            if chat_id is not None:
+                item.setData(CHAT_BADGE_ROLE, counts.get(chat_id, 0))
+
+    def _order_files(self):
+        chat = self._current_chat()
+        return self._orders().files(chat[0]) if chat else []
+
+    def _refresh_order(self):
+        chat = self._current_chat()
+        files = self._order_files()
+        self.order_card.setVisible(bool(files))
+        if not files:
+            return
+        p = prefs(self.config)
+        result = summarize(files, p["price"], self._page_cache)
+        self.order_title.setText(f"🧾 طلب {chat[1]}")
+        last = self._orders().last_at(chat[0])
+        if last:
+            minutes = int((clock.time() - last) // 60)
+            self.order_age.setText("آخر ملف: الآن" if minutes < 1 else f"آخر ملف قبل {minutes} دقيقة")
+        self.order_summary.setText(f"{result.files} ملف: {result.describe()}")
+        pages = f"المجموع: {result.pages} صفحة"
+        if p["price"]:
+            pages += f" × {format_money(p['price'])} = {format_money(result.price, p['currency'])}"
+        if result.unknown:
+            pages += f"  (+ {len(result.unknown)} ملف لا يُعرف عدد صفحاته)"
+        self.order_pages.setText(pages)
+        self.merge_btn.setEnabled(any(group_of(f) == "images" for f in files)
+                                  and self.job not in ("download", "preview", "scan"))
+
+    def _order_folder(self, files):
+        try:
+            return Path(os.path.commonpath([str(f.parent) for f in files]))
+        except ValueError:            # files on different drives
+            return files[0].parent
+
+    def open_order_folder(self):
+        files = self._order_files()
+        folder = self._order_folder(files) if files else Path(prefs(self.config)["out_dir"])
+        folder.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    def print_order(self):
+        files = self._order_files()
+        if not files:
+            return
+        printer = QPrinter(QPrinter.HighResolution)
+        dialog = QPrintDialog(printer, self)
+        dialog.setWindowTitle("طباعة الطلب")
+        accepted = dialog.exec() == QDialog.Accepted
+        _dispose(dialog)
+        if not accepted:
+            return
+        progress = QProgressDialog("جارٍ إرسال الطلب إلى الطابعة...", "إلغاء", 0, len(files), self)
+        progress.setWindowTitle("الطباعة")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+
+        def step(done, total):
+            progress.setValue(done)
+            QApplication.processEvents()
+        result = printing.print_files(printer, files, step, progress.wasCanceled)
+        progress.close()
+        _dispose(progress)
+        lines = [f"أُرسلت {result.pages} صفحة إلى الطابعة."]
+        if result.sent:
+            lines.append(f"و{len(result.sent)} ملف (وورد وغيره) طُبع ببرنامجه على الجهاز.")
+        for path, reason in result.failed:
+            lines.append(f"✖ {Path(path).name}: {reason}")
+        self.log("🖨 " + " ".join(lines))
+        QMessageBox.information(self, "الطباعة", "\n".join(lines))
+
+    def merge_order(self):
+        chat = self._current_chat()
+        images = [f for f in self._order_files() if group_of(f) == "images"]
+        if not chat or not images:
+            return
+        folder = self._order_folder(images)
+        out = folder / f"{chat[1]} - {len(images)} صورة.pdf"
+        number = 2
+        while out.exists():
+            out = folder / f"{chat[1]} - {len(images)} صورة ({number}).pdf"
+            number += 1
+        progress = QProgressDialog("جارٍ دمج الصور في ملف PDF...", None, 0, len(images), self)
+        progress.setWindowTitle("دمج الصور")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+
+        def step(done, total):
+            progress.setValue(done)
+            QApplication.processEvents()
+        try:
+            result = merge_images(images, out, decode=qimage_pixels, progress=step)
+        except OSError as e:
+            progress.close()
+            _dispose(progress)
+            QMessageBox.warning(self, "دمج الصور", f"تعذّر إنشاء الملف: {e}")
+            return
+        progress.close()
+        _dispose(progress)
+        if not result.pages:
+            QMessageBox.warning(self, "دمج الصور", "لا توجد صور يمكن دمجها.")
+            return
+        p = prefs(self.config)
+        if p["auto_delete"]:
+            cleanup.schedule(self._cleanup_store(), [out], p["delete_after"] * 60,
+                             root=Path(p["out_dir"]))
+            self._show_cleanup_status()
+        text = f"تم إنشاء ملف PDF فيه {result.pages} صورة بالترتيب:\n{out.name}"
+        if result.skipped:
+            text += f"\n\nلم تُضَف {len(result.skipped)} صورة لأن صيغتها غير مدعومة."
+        self.log(f"🧾 {out.name} ({result.pages} صفحة)")
+        box = QMessageBox(QMessageBox.Information, "دمج الصور", text, parent=self)
+        open_file = box.addButton("فتح الملف", QMessageBox.AcceptRole)
+        open_folder = box.addButton("فتح المجلد", QMessageBox.ActionRole)
+        box.addButton("إغلاق", QMessageBox.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        _dispose(box)
+        if clicked is open_file:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(out)))
+        elif clicked is open_folder:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    def deliver_order(self):
+        chat = self._current_chat()
+        files = self._order_files()
+        if not chat:
+            return
+        box = QMessageBox(QMessageBox.Question, "تم التسليم",
+                          f"إنهاء طلب {chat[1]} ({len(files)} ملف)؟", parent=self)
+        delete = box.addButton("إنهاء وحذف الملفات", QMessageBox.DestructiveRole)
+        keep = box.addButton("إنهاء فقط (إبقاء الملفات)", QMessageBox.AcceptRole)
+        box.addButton("إلغاء", QMessageBox.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        _dispose(box)
+        if clicked not in (delete, keep):
+            return
+        if clicked is delete:
+            root = prefs(self.config)["out_dir"]
+            for path in files:
+                try:
+                    os.remove(path)
+                    cleanup._prune_empty_dirs(path, root)
+                except OSError:
+                    pass
+            self.log(f"🗑 حُذفت ملفات طلب {chat[1]} ({len(files)} ملف).")
+        self._orders().clear(chat[0])
+        self._refresh_badges()
+        self._refresh_order()
+
+    # -- auto-receive -------------------------------------------------------------------
+
+    def _show_auto_state(self):
+        on = self.auto_btn.isChecked()
+        self.auto_btn.setText("📥 الاستقبال التلقائي: يعمل" if on else "📥 الاستقبال التلقائي: متوقف")
+
+    def _toggle_auto(self, on):
+        self.config["auto_receive"] = on
+        try:
+            self.config.save()
+        except OSError:
+            pass
+        self._show_auto_state()
+        self._apply_auto_settings()
+        self._show_chat_auto()
+
+    def _apply_auto_settings(self):
+        """Tell the worker what to receive automatically (or to stop)."""
+        p = prefs(self.config)
+        on = p["auto_receive"] and self.logged_in
+        self.auto_btn.blockSignals(True)
+        self.auto_btn.setChecked(p["auto_receive"])
+        self.auto_btn.blockSignals(False)
+        self._show_auto_state()
+        if not on:
+            self.worker.configure_auto(False)
+            return
+        try:
+            options = build_options(self.config)
+        except ValueError as e:
+            QMessageBox.warning(self, APP_TITLE, f"لا يمكن تشغيل الاستقبال التلقائي: {e}")
+            self.auto_btn.setChecked(False)
+            return
+        self.auto_out_dir = options.out_dir
+        self.worker.configure_auto(True, options, p["auto_scope"], p["auto_chats"])
+
+    def _show_chat_auto(self):
+        chat = self._current_chat()
+        p = prefs(self.config)
+        item = self.chat_list.currentItem()
+        is_person = item is not None and item.data(CHAT_KIND_ROLE) == "user"
+        selected_mode = p["auto_scope"] == "selected"
+        self.chat_auto_check.setVisible(chat is not None and selected_mode)
+        self.chat_auto_label.setVisible(chat is not None and not selected_mode and is_person
+                                        and p["auto_receive"])
+        if chat is not None:
+            self.chat_auto_check.blockSignals(True)
+            self.chat_auto_check.setChecked(chat[0] in p["auto_chats"])
+            self.chat_auto_check.blockSignals(False)
+
+    def _on_chat_auto_toggled(self, on):
+        chat = self._current_chat()
+        if chat is None:
+            return
+        chats = set(prefs(self.config)["auto_chats"])
+        (chats.add if on else chats.discard)(chat[0])
+        self.config["auto_chats"] = sorted(chats)
+        try:
+            self.config.save()
+        except OSError:
+            pass
+        self._apply_auto_settings()
+
+    def _on_auto_event(self, name, data):
+        if name == "saved" and self.auto_out_dir is not None:
+            p = prefs(self.config)
+            delete_after = p["delete_after"] * 60 if p["auto_delete"] else None
+            self._file_saved(data["chat_id"], data["chat_name"], self.auto_out_dir / data["path"],
+                             data, delete_after)
+        elif name == "failed":
+            self.log(f"✖ استقبال تلقائي من {data['chat_name']}: {friendly_error(data['error'])}")
+
+    def _on_auto_done(self, chat_id, chat_name, count):
+        text = f"📥 وصل {count} ملف من {chat_name}"
+        self.log(text)
+        self.chats_status.setText(text)
+        self._notify("ملفات جديدة", f"وصل {count} ملف من {chat_name}")
+
+    def _notify(self, title, text):
+        if prefs(self.config)["auto_sound"]:
+            QApplication.beep()
+        if self.tray is not None:
+            self.tray.showMessage(title, text, QSystemTrayIcon.Information, 8000)
+
+    def _setup_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray = QSystemTrayIcon(self.windowIcon() or QIcon(), self)
+        self.tray.setToolTip(APP_TITLE)
+        menu = QMenu(self)
+        menu.addAction("فتح البرنامج", self._show_from_tray)
+        menu.addAction("الاستقبال التلقائي (تشغيل/إيقاف)", self.auto_btn.toggle)
+        menu.addSeparator()
+        menu.addAction("خروج", self.quit_app)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(lambda reason: self._show_from_tray()
+                                    if reason == QSystemTrayIcon.Trigger else None)
+        self.tray.messageClicked.connect(self._show_from_tray)
+        self.tray.show()
+
+    def _show_from_tray(self):
+        self.show()
+        self.setWindowState(self.windowState() & ~Qt.WindowMinimized)
+        self.raise_()
+        self.activateWindow()
+
+    def quit_app(self):
+        self._quitting = True
+        self.close()
+
     # -- auto-delete ------------------------------------------------------------
 
     def _cleanup_store(self):
@@ -1076,6 +1427,18 @@ class MainWindow(QMainWindow):
             self._show_cleanup_status()
 
     def closeEvent(self, event):
+        p = prefs(self.config)
+        if (not self._quitting and self.tray is not None and p["keep_running"]
+                and self.auto_btn.isChecked()):
+            # Keep receiving files in the background, next to the clock.
+            event.ignore()
+            self.hide()
+            if not self._tray_hint_shown:
+                self._tray_hint_shown = True
+                self.tray.showMessage(APP_TITLE, "البرنامج ما زال يستقبل الملفات في الخلفية. "
+                                      "للخروج نهائياً: اضغط على أيقونته بجانب الساعة ← خروج.",
+                                      QSystemTrayIcon.Information, 8000)
+            return
         if self.job in ("download", "preview", "scan"):
             answer = QMessageBox.question(self, APP_TITLE,
                                           "التنزيل ما زال يعمل. هل تريد إيقافه والخروج؟")
@@ -1092,5 +1455,7 @@ class MainWindow(QMainWindow):
                 updater.launch_detached(cleanup.helper_command())
             except OSError:
                 pass
+        if self.tray is not None:
+            self.tray.hide()
         self.worker.shutdown()
         event.accept()

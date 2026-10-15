@@ -5,17 +5,21 @@ submitted to the worker loop, and its outcome comes back as a Qt signal.
 """
 
 import asyncio
+import dataclasses
 import datetime
 import logging
 import threading
 import time
 
 from PySide6.QtCore import QObject, Signal
-from telethon import TelegramClient, errors
+from telethon import TelegramClient, errors, events
 from telethon.tl import functions, types
 
 from ..downloader import Downloader
+from ..filters import media_kind
 from ..naming import display_name
+
+AUTO_SETTLE = 4.0        # seconds without new files before a batch is downloaded
 
 
 class LoginCancelled(Exception):
@@ -108,6 +112,8 @@ class TelegramWorker(QObject):
     job_done = Signal(str, object)      # job name, result
     job_failed = Signal(str, object)    # job name, exception
     event = Signal(str, dict)           # downloader event name, data
+    auto_event = Signal(str, dict)      # same, for auto-received files (+ chat_id, chat_name)
+    auto_done = Signal(int, str, int)   # chat id, chat name, files saved
 
     def __init__(self):
         super().__init__()
@@ -119,6 +125,10 @@ class TelegramWorker(QObject):
         self._client_key = None
         self._answer = None
         self.chats = {}           # dialog id -> (entity, name)
+        self._auto = None          # auto-receive settings while it is on
+        self._auto_handler = None
+        self._auto_batches = {}    # chat id -> [message ids] waiting to be fetched
+        self._auto_timers = {}     # chat id -> pending flush (asyncio.TimerHandle)
         self.me_id = None
         self.downloader = None    # the running Downloader, for live stats
         self._last_progress = 0.0
@@ -194,6 +204,8 @@ class TelegramWorker(QObject):
                 await self._interactive_login()
         me = await self.client.get_me()
         self.me_id = me.id
+        self._detach_auto()
+        self._apply_auto(self._auto)       # auto-receive may have been switched on early
         return display_name(me) or (f"+{me.phone}" if me.phone else str(me.id))
 
     async def _qr_login(self):
@@ -377,7 +389,82 @@ class TelegramWorker(QObject):
                                      log=lambda _line: None, on_event=self._on_event)
         return await self.downloader.run()
 
+    # -- auto-receive -------------------------------------------------------------
+
+    def configure_auto(self, enabled, options=None, scope="private", chat_ids=()):
+        """Turn auto-receive on/off or change what it fetches (any thread)."""
+        settings = None
+        if enabled:
+            settings = {"options": options, "scope": scope, "chat_ids": set(chat_ids)}
+        self.loop.call_soon_threadsafe(self._apply_auto, settings)
+
+    def _detach_auto(self):
+        if self._auto_handler is not None and self.client is not None:
+            self.client.remove_event_handler(self._auto_handler)
+        self._auto_handler = None
+
+    def _apply_auto(self, settings):
+        self._auto = settings
+        if self.client is None:
+            return
+        if settings and self._auto_handler is None:
+            self._auto_handler = self._on_new_message
+            self.client.add_event_handler(self._auto_handler,
+                                          events.NewMessage(incoming=True))
+        elif not settings:
+            self._detach_auto()
+
+    def _wants(self, chat_id, is_private, sender):
+        auto = self._auto
+        if not auto:
+            return False
+        if auto["scope"] == "selected":
+            return chat_id in auto["chat_ids"]
+        # "private": one-to-one chats with people (customers), not bots
+        return is_private and not getattr(sender, "bot", False)
+
+    async def _on_new_message(self, event):
+        msg = event.message
+        if media_kind(msg) is None:
+            return
+        sender = await event.get_sender()
+        if not self._wants(event.chat_id, event.is_private, sender):
+            return
+        self._queue_auto(event.chat_id, msg.id)
+
+    def _queue_auto(self, chat_id, msg_id):
+        """Albums arrive as many messages: wait until they settle, then fetch all."""
+        self._auto_batches.setdefault(chat_id, []).append(msg_id)
+        timer = self._auto_timers.pop(chat_id, None)
+        if timer is not None:
+            timer.cancel()
+        self._auto_timers[chat_id] = self.loop.call_later(
+            AUTO_SETTLE, lambda: asyncio.ensure_future(self._flush_auto(chat_id)))
+
+    async def _flush_auto(self, chat_id):
+        self._auto_timers.pop(chat_id, None)
+        ids = self._auto_batches.pop(chat_id, [])
+        auto = self._auto
+        if not ids or not auto:
+            return
+        try:
+            entity, name = await self._resolve_chat(chat_id)
+            options = dataclasses.replace(auto["options"], ids=sorted(ids), dry_run=False)
+
+            def on_event(event_name, **data):
+                if event_name == "progress":
+                    return
+                self.auto_event.emit(event_name, {**data, "chat_id": chat_id, "chat_name": name})
+            downloader = Downloader(self.client, entity, options, chat_name=name,
+                                    log=lambda _line: None, on_event=on_event)
+            stats = await downloader.run()
+            if stats.downloaded:
+                self.auto_done.emit(chat_id, name, stats.downloaded)
+        except Exception as e:  # noqa: BLE001 - one bad batch must not stop receiving
+            self.notice.emit(f"تعذّر الاستقبال التلقائي من محادثة: {friendly_error(e)}")
+
     async def logout(self):
+        self._detach_auto()
         if self.client is not None:
             if not self.client.is_connected():
                 await self.client.connect()

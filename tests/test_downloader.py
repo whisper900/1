@@ -248,3 +248,18 @@ def test_planned_event_describes_the_file(tmp_path):
     assert name == "planned"
     assert data["file_name"] == "cv.pdf" and data["sender"] == "Ahmed Ali"
     assert data["kind"] == "document" and data["date"] == day(3) and data["msg_id"] == 1
+
+
+def test_day_folder_and_thumbnail(tmp_path):
+    from telethon.tl import types
+    events = []
+    msg = FakeMsg(1, AHMED, kind="photo", ext=".jpg", date=day(5))
+    msg.photo = SimpleNamespace(sizes=[types.PhotoStrippedSize(type="i", bytes=b"\x01\x08\x08" + b"\0" * 10)])
+    client = FakeClient([msg])
+    dl = Downloader(client, CHAT, Options(out_dir=tmp_path, folder="{day}/{sender}", dry_run=True),
+                    log=lambda _: None, on_event=lambda name, **d: events.append(d))
+    asyncio.run(dl.run())
+    (data,) = events
+    local_day = day(5).astimezone().strftime("%Y-%m-%d")
+    assert str(data["path"]).startswith(local_day)
+    assert data["thumb"][:2] == b"\xff\xd8"               # a JPEG preview

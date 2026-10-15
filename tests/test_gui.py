@@ -60,6 +60,8 @@ class FakeWorker(QObject):
     notice = Signal(str)
     chats_partial = Signal(list)
     flood_wait = Signal(int, str)
+    auto_event = Signal(str, dict)
+    auto_done = Signal(int, str, int)
     job_done = Signal(str, object)
     job_failed = Signal(str, object)
     event = Signal(str, dict)
@@ -100,6 +102,9 @@ class FakeWorker(QObject):
     def shutdown(self):
         pass
 
+    def configure_auto(self, enabled, options=None, scope="private", chat_ids=()):
+        self.auto = (enabled, options, scope, set(chat_ids)) if enabled else None
+
 
 def make_window(tmp_path):
     config = Config(tmp_path / "settings.json")
@@ -108,6 +113,7 @@ def make_window(tmp_path):
     win = window_mod.MainWindow(config=config, worker=worker, autostart=False)
     win.chat_cache_path = tmp_path / "chats.json"
     win.cleanup_store = tmp_path / "cleanup.json"
+    win.orders_path = tmp_path / "orders.json"
     return win, worker
 
 
@@ -207,7 +213,7 @@ def test_settings_dialog_saves_everything(app, tmp_path, no_dialogs):
 
     dialog._save()                                   # API is required here
     assert any("API ID" in text for _, text in no_dialogs)
-    assert dialog.tabs.currentIndex() == 2
+    assert dialog.tabs.currentIndex() == 4                 # the account tab
     dialog.api_id.setText("12345")
     dialog.api_hash.setText("ab" * 16)
     dialog._save()
@@ -873,3 +879,262 @@ def test_cleanup_mode_runs_without_a_window(monkeypatch, tmp_path):
     monkeypatch.setattr(cleanup, "run_helper", lambda store: calls.append(store) or 0)
     assert app_mod.main(["TelegramDownloader.exe", "--cleanup"]) == 0
     assert calls == [tmp_path / "c.json"]
+
+
+# -- auto-receive ----------------------------------------------------------------
+
+def test_auto_receive_batches_an_album_and_downloads_it(app, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from tests.fakes import FakeClient, FakeMsg, user
+    from tgdl.downloader import Options
+    from tgdl.gui import worker as worker_mod
+    monkeypatch.setattr(worker_mod, "AUTO_SETTLE", 0.05)
+
+    class AutoClient(FakeClient):
+        handlers = []
+
+        def add_event_handler(self, handler, event):
+            self.handlers.append(handler)
+
+        def remove_event_handler(self, handler):
+            self.handlers.remove(handler)
+
+        async def get_entity(self, chat_id):
+            return SimpleNamespace(id=5, first_name="أحمد", last_name=None, title=None)
+
+    ahmed = user(5, "أحمد")
+    client = AutoClient([FakeMsg(i, ahmed, kind="photo", ext=".jpg") for i in (1, 2, 3)])
+    worker = TelegramWorker()
+    worker.client = client
+    saved, done = [], []
+    worker.auto_event.connect(lambda name, data: saved.append((name, data)))
+    worker.auto_done.connect(lambda *args: done.append(args))
+    try:
+        worker.configure_auto(True, Options(out_dir=tmp_path), "private")
+        wait_for(app, worker.submit("x", asyncio.sleep(0.01)))
+        assert len(client.handlers) == 1
+
+        async def album():
+            for i in (1, 2, 3):              # three photos arrive in quick succession
+                worker._queue_auto(5, i)
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.3)
+        wait_for(app, worker.submit("album", album()))
+        app.processEvents()
+        assert sorted(client.download_calls) == [1, 2, 3]
+        assert [n for n, _ in saved].count("saved") == 3
+        assert all(d["chat_id"] == 5 and d["chat_name"] == "أحمد" for _, d in saved)
+        assert done == [(5, "أحمد", 3)]                    # one notification per album
+
+        worker.configure_auto(False)
+        wait_for(app, worker.submit("x", asyncio.sleep(0.01)))
+        assert client.handlers == []
+    finally:
+        worker.shutdown()
+
+
+def test_auto_receive_scope(app):
+    from types import SimpleNamespace
+    worker = TelegramWorker()
+    try:
+        worker._auto = {"scope": "private", "chat_ids": set(), "options": None}
+        person, bot = SimpleNamespace(bot=False), SimpleNamespace(bot=True)
+        assert worker._wants(5, True, person)
+        assert not worker._wants(5, True, bot)               # bots are not customers
+        assert not worker._wants(-100, False, person)        # groups and channels
+        worker._auto = {"scope": "selected", "chat_ids": {-100}, "options": None}
+        assert worker._wants(-100, False, person) and not worker._wants(5, True, person)
+        worker._auto = None
+        assert not worker._wants(5, True, person)
+    finally:
+        worker.shutdown()
+
+
+# -- orders: card, badges, merge, print, deliver ---------------------------------
+
+def order_window(tmp_path, monkeypatch=None, price=0):
+    win, worker = make_window(tmp_path)
+    win.config.update(price=price, currency="د.ع")
+    win.logged_in = True
+    worker.job_done.emit("chats", CHATS)
+    win.chat_list.setCurrentRow(1)                 # Sara (42)
+    return win, worker
+
+
+def receive(win, worker, tmp_path, names, chat=(42, "Sara")):
+    """Simulate a download of ``names`` for ``chat`` through the saved events."""
+    win.chat_list.setCurrentRow(1)
+    win.start(chat=chat)
+    out = tmp_path / "out"
+    for i, name in enumerate(names, 1):
+        path = out / "Sara" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if name.endswith(".jpg"):
+            from PySide6.QtGui import QImage
+            img = QImage(40, 30, QImage.Format_RGB888)
+            img.fill(Qt.red)
+            img.save(str(path), "JPEG")
+        else:
+            path.write_bytes(b"x")
+        worker.event.emit("saved", {"path": Path("Sara") / name, "size": 1, "msg_id": i,
+                                    "kind": "photo" if name.endswith(".jpg") else "document"})
+    win._job_finished()
+
+
+def test_order_card_badge_and_price(app, tmp_path):
+    win, worker = order_window(tmp_path, price=250)
+    assert win.order_card.isHidden()
+    receive(win, worker, tmp_path, ["1.jpg", "2.jpg", "3.jpg", "notes.zip"])
+    assert not win.order_card.isHidden()
+    assert "4 ملف" in win.order_summary.text() and "3 صورة" in win.order_summary.text()
+    assert "3 صفحة" in win.order_pages.text() and "750 د.ع" in win.order_pages.text()
+    assert "لا يُعرف" in win.order_pages.text()            # the zip has no page count
+    item = win.chat_list.item(1)
+    assert item.data(window_mod.CHAT_BADGE_ROLE) == 4
+    win.close()
+
+
+def test_merge_order_makes_a_pdf_and_keeps_photos(app, tmp_path):
+    pdfium = pytest.importorskip("pypdfium2")
+    win, worker = order_window(tmp_path)
+    receive(win, worker, tmp_path, ["1.jpg", "2.jpg"])
+    before = {p: p.read_bytes() for p in (tmp_path / "out" / "Sara").iterdir()}
+    win.merge_order()
+    pdf = tmp_path / "out" / "Sara" / "Sara - 2 صورة.pdf"
+    assert pdf.exists() and len(pdfium.PdfDocument(str(pdf))) == 2
+    assert all(p.read_bytes() == data for p, data in before.items())   # photos untouched
+    win.merge_order()                                        # never overwrites
+    assert (tmp_path / "out" / "Sara" / "Sara - 2 صورة (2).pdf").exists()
+    win.close()
+
+
+def test_print_order_through_the_print_dialog(app, tmp_path, monkeypatch, no_dialogs):
+    pytest.importorskip("pypdfium2")
+
+    class Dialog:
+        def __init__(self, printer, parent):
+            printer.setOutputFormat(window_mod.QPrinter.PdfFormat)
+            printer.setOutputFileName(str(tmp_path / "printed.pdf"))
+
+        def setWindowTitle(self, title):
+            pass
+
+        def exec(self):
+            return window_mod.QDialog.Accepted
+    monkeypatch.setattr(window_mod, "QPrintDialog", Dialog)
+    win, worker = order_window(tmp_path)
+    receive(win, worker, tmp_path, ["1.jpg", "2.jpg"])
+    win.print_order()
+    assert (tmp_path / "printed.pdf").exists()
+    assert any("أُرسلت 2 صفحة" in text for _, text in no_dialogs)
+    win.close()
+
+
+def test_deliver_order_deletes_or_keeps_files(app, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    role = {"value": QMessageBox.DestructiveRole}
+    monkeypatch.setattr(QMessageBox, "clickedButton", lambda self: next(
+        b for b in self.buttons() if self.buttonRole(b) == role["value"]))
+    win, worker = order_window(tmp_path)
+    receive(win, worker, tmp_path, ["1.jpg"])
+    role["value"] = QMessageBox.AcceptRole                     # finish, keep files
+    win.deliver_order()
+    assert (tmp_path / "out" / "Sara" / "1.jpg").exists() and win.order_card.isHidden()
+    receive(win, worker, tmp_path, ["2.jpg"])
+    role["value"] = QMessageBox.DestructiveRole                # finish and delete
+    win.deliver_order()
+    assert not (tmp_path / "out" / "Sara" / "2.jpg").exists()  # this order's file is gone
+    assert (tmp_path / "out" / "Sara" / "1.jpg").exists()      # the kept one is not touched
+    (tmp_path / "out" / "Sara" / "1.jpg").unlink()
+    receive(win, worker, tmp_path, ["3.jpg"])
+    win.deliver_order()
+    assert not (tmp_path / "out" / "Sara").exists()            # empty folder removed too
+    assert (tmp_path / "out").exists()
+    assert win.chat_list.item(1).data(window_mod.CHAT_BADGE_ROLE) == 0
+    win.close()
+
+
+def test_auto_receive_toggle_and_incoming_files(app, tmp_path, no_dialogs):
+    win, worker = order_window(tmp_path)
+    win.auto_btn.setChecked(True)
+    assert win.config["auto_receive"] and "يعمل" in win.auto_btn.text()
+    enabled, options, scope, chats = worker.auto
+    assert enabled and scope == "private" and options.out_dir == tmp_path / "out"
+
+    path = tmp_path / "out" / "Sara" / "9.jpg"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"x")
+    worker.auto_event.emit("saved", {"path": Path("Sara/9.jpg"), "msg_id": 9, "kind": "photo",
+                                     "chat_id": 42, "chat_name": "Sara", "size": 1})
+    worker.auto_done.emit(42, "Sara", 1)
+    assert win.chat_list.item(1).data(window_mod.CHAT_BADGE_ROLE) == 1
+    assert "وصل 1 ملف من Sara" in win.chats_status.text()
+    assert not win.order_card.isHidden()                       # Sara is the open chat
+
+    win.config["auto_scope"] = "selected"
+    win._show_chat_auto()
+    assert not win.chat_auto_check.isHidden()
+    win.chat_auto_check.setChecked(True)
+    assert win.config["auto_chats"] == [42] and worker.auto[2] == "selected"
+    assert worker.auto[3] == {42}
+    win.auto_btn.setChecked(False)
+    assert worker.auto is None
+    win.close()
+
+
+def test_close_hides_to_tray_while_receiving(app, tmp_path):
+    class Tray:
+        messages = []
+
+        def showMessage(self, *args):
+            self.messages.append(args)
+
+        def hide(self):
+            pass
+    win, worker = order_window(tmp_path)
+    win.tray = Tray()
+    win.show()
+    win.auto_btn.setChecked(True)
+    win.close()
+    assert win.isHidden() and Tray.messages                     # still running, told once
+    win.quit_app()                                              # tray menu → خروج
+    assert win._quitting
+
+
+def test_qimage_pixels_are_tightly_packed(app, tmp_path):
+    from PySide6.QtGui import QImage
+    img = QImage(7, 3, QImage.Format_ARGB32)                    # odd width: padded rows
+    img.fill(Qt.transparent)
+    img.save(str(tmp_path / "a.png"))
+    width, height, data = window_mod.qimage_pixels(tmp_path / "a.png")
+    assert (width, height) == (7, 3) and len(data) == 7 * 3 * 3
+    assert set(data) == {255}                                   # transparent → white paper
+
+
+def test_picker_quick_ranges_and_thumbnails(app):
+    import datetime as dt
+    from tgdl.gui.picker import SelectFilesDialog
+    now = dt.datetime.now(dt.timezone.utc)
+    from PySide6.QtCore import QBuffer, QByteArray, QIODevice
+    from PySide6.QtGui import QImage
+    tiny, raw = QImage(8, 8, QImage.Format_RGB888), QByteArray()
+    tiny.fill(Qt.blue)
+    buffer = QBuffer(raw)
+    buffer.open(QIODevice.WriteOnly)
+    tiny.save(buffer, "JPEG")
+    jpeg = bytes(raw)
+    items = [dict(picked(1), date=now, thumb=jpeg), dict(picked(2), date=now - dt.timedelta(days=1)),
+             dict(picked(3), date=now - dt.timedelta(days=30))]
+    dialog = SelectFilesDialog(items)
+    from tgdl.gui.picker import ID_ROLE
+    rows = {r.data(0, ID_ROLE): r for r in dialog._rows()}
+    assert not rows[1].icon(0).isNull()                       # tiny preview from Telegram
+    assert rows[2].icon(0).isNull()                           # none sent: no icon
+    dialog.quick_range(0)
+    assert visible_ids(dialog) == [1]
+    dialog.quick_range(1)
+    assert visible_ids(dialog) == [2]
+    dialog.quick_range(6)
+    assert visible_ids(dialog) == [2, 1]                        # oldest first, like the chat
+    dialog.quick_range(None)
+    assert visible_ids(dialog) == [3, 2, 1]

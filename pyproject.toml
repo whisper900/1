@@ -12,8 +12,8 @@ dependencies = ["telethon>=1.36"]
 
 [project.optional-dependencies]
 fast = ["cryptg"]
-gui = ["PySide6-Essentials>=6.5", "segno>=1.5"]
-test = ["pytest"]
+gui = ["PySide6-Essentials>=6.5", "segno>=1.5", "pypdfium2>=4.30"]
+test = ["pytest", "pillow"]
 
 [project.scripts]
 tgdl = "tgdl.cli:main"

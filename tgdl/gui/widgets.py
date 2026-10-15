@@ -6,10 +6,13 @@ from PySide6.QtWidgets import QFrame, QStyle, QStyledItemDelegate, QVBoxLayout
 
 from .theme import ACCENT, MUTED, TEXT, paint_avatar
 
+BADGE = "#22B25F"
+
 CHAT_ID_ROLE = Qt.UserRole
 CHAT_TITLE_ROLE = Qt.UserRole + 1
 CHAT_KIND_ROLE = Qt.UserRole + 2
 CHAT_MARK_ROLE = Qt.UserRole + 3
+CHAT_BADGE_ROLE = Qt.UserRole + 4      # files waiting in this chat's order
 
 CHAT_KINDS = {"user": "شخص", "group": "مجموعة", "channel": "قناة", "saved": "محفوظة"}
 
@@ -75,6 +78,27 @@ class ChatDelegate(QStyledItemDelegate):
         else:
             text = QRect(avatar.right() + pad, rect.top(), rect.right() - avatar.right() - 2 * pad,
                          rect.height())
+
+        badge = index.data(CHAT_BADGE_ROLE) or 0
+        if badge:
+            label = str(badge) if badge < 1000 else "999+"
+            badge_font = QFont(option.font)
+            badge_font.setBold(True)
+            badge_font.setPointSizeF(max(7.0, option.font.pointSizeF() - 1))
+            metrics = QFontMetrics(badge_font)
+            width = max(22, metrics.horizontalAdvance(label) + 12)
+            pill = QRect(0, rect.center().y() - 11, width, 22)
+            pill.moveLeft(text.left() if rtl else text.right() - width)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("white" if selected else BADGE))
+            painter.drawRoundedRect(pill, 11, 11)
+            painter.setFont(badge_font)
+            painter.setPen(QColor(ACCENT if selected else "white"))
+            painter.drawText(pill, Qt.AlignCenter, label)
+            if rtl:
+                text.setLeft(pill.right() + 8)
+            else:
+                text.setRight(pill.left() - 8)
         align = (Qt.AlignRight if rtl else Qt.AlignLeft) | Qt.AlignVCenter
 
         name_font = QFont(option.font)

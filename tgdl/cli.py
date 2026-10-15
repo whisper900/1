@@ -21,7 +21,7 @@ examples:
   python -m tgdl --chat me --folder "{sender}/{type}"
 
 folder placeholders: {chat} {chat_id} {sender} {sender_id} {username}
-                     {type} {year} {month}
+                     {type} {year} {month} {day}
 """
 
 

@@ -21,7 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-gui.txt pyinstaller pytest
+          pip install -r requirements-gui.txt pyinstaller pytest pillow
 
       - name: Run tests
         env:
@@ -42,6 +42,7 @@ jobs:
           --icon assets/icon.ico
           --add-data "assets/icon.png;assets"
           --hidden-import cryptg
+          --collect-all pypdfium2 --collect-all pypdfium2_raw --exclude-module PIL
           TelegramDownloader.py
 
       - name: Check that the exe starts

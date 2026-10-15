@@ -15,7 +15,7 @@ from .naming import (default_filename, display_name, ext_group, highest_number,
 from .state import DownloadLog
 
 DEFAULT_FOLDER = "{chat}/{sender}"
-FOLDER_FIELDS = ("chat", "chat_id", "sender", "sender_id", "username",
+FOLDER_FIELDS = ("chat", "chat_id", "sender", "sender_id", "username", "day",
                  "type", "year", "month")
 
 
@@ -47,6 +47,20 @@ class Stats:
     failed: int = 0
     bytes: int = 0
     failures: list = field(default_factory=list)
+
+
+def stripped_thumbnail(msg):
+    """Tiny JPEG preview that Telegram sends inside the message, or None.
+
+    It costs no download; Telethon only has to add the JPEG headers.
+    """
+    media = getattr(msg, "photo", None) or getattr(msg, "document", None)
+    sizes = getattr(media, "sizes", None) or getattr(media, "thumbs", None) or []
+    for size in sizes:
+        if type(size).__name__ == "PhotoStrippedSize":
+            from telethon.utils import stripped_photo_to_jpg
+            return stripped_photo_to_jpg(size.bytes)
+    return None
 
 
 def human_size(num):
@@ -109,7 +123,8 @@ class Downloader:
                              f"({human_size(msg.file.size)})")
                     self._emit("planned", msg_id=msg.id, path=rel, size=msg.file.size,
                                kind=kind, date=msg.date, file_name=msg.file.name,
-                               sender=sender_fields(sender)["sender"])
+                               sender=sender_fields(sender)["sender"],
+                               thumb=stripped_thumbnail(msg))
                     self.stats.bytes += msg.file.size or 0
                     if self.opts.limit and self.stats.queued >= self.opts.limit:
                         break
@@ -171,6 +186,8 @@ class Downloader:
             "type": self.opts.type_names.get(kind, kind),
             "year": f"{msg.date:%Y}" if msg.date else "nodate",
             "month": f"{msg.date:%m}" if msg.date else "nodate",
+            # Calendar day the file was sent, in this computer's time zone.
+            "day": f"{msg.date.astimezone():%Y-%m-%d}" if msg.date else "nodate",
             **sender_fields(sender),
         }
         folder = self.out_dir / render_folder(self.opts.folder, fields)
