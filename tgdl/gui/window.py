@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 from telethon import errors as tg_errors
 
 from .. import __version__
-from . import updater
+from . import cleanup, updater
 from .config import (Config, chat_cache_age, clear_chat_cache, load_chat_cache,
                      save_chat_cache, session_path)
 from .settings import (TAB_ACCOUNT, TAB_FILES, SettingsDialog, build_options, default_out_dir,
@@ -226,7 +226,16 @@ class MainWindow(QMainWindow):
         self.stats_timer = QTimer(self, interval=300)
         self.stats_timer.timeout.connect(self._refresh_stats)
 
+        # Auto-delete: due files are removed every few seconds while the app runs.
+        self.cleanup_store = None          # None = the app's settings folder
+        self.run_out_dir = None
+        self.run_delete_after = None       # seconds, captured when a download starts
+        self.cleanup_timer = QTimer(self, interval=15000)
+        self.cleanup_timer.timeout.connect(self._cleanup_tick)
+        self.cleanup_timer.start()
+
         if autostart:
+            QTimer.singleShot(0, self._cleanup_tick)
             QTimer.singleShot(0, self._first_start)
 
     # -- layout -------------------------------------------------------------
@@ -421,10 +430,22 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.stats_label = QLabel(" ", objectName="status")
         self.stats_label.setWordWrap(True)
+        self.cleanup_label = QLabel(objectName="status")
+        self.cleanup_label.setWordWrap(True)
+        self.delete_now_btn = set_kind(QPushButton("احذفها الآن"), "ghost")
+        self.delete_now_btn.clicked.connect(self.delete_scheduled_now)
+        cleanup_row = QHBoxLayout()
+        cleanup_row.addWidget(self.cleanup_label, 1)
+        cleanup_row.addWidget(self.delete_now_btn)
+        self.cleanup_row = QWidget()
+        self.cleanup_row.setLayout(cleanup_row)
+        cleanup_row.setContentsMargins(0, 0, 0, 0)
+        self.cleanup_row.hide()
         progress_card.body.addLayout(progress_top)
         progress_card.body.addWidget(self.current_label)
         progress_card.body.addWidget(self.progress)
         progress_card.body.addWidget(self.stats_label)
+        progress_card.body.addWidget(self.cleanup_row)
 
         self.log_toggle = set_kind(QPushButton("عرض السجل ▾"), "ghost")
         self.log_toggle.setCheckable(True)
@@ -800,6 +821,9 @@ class MainWindow(QMainWindow):
         return (chat_id, item.data(Qt.UserRole + 1)) if chat_id is not None else None
 
     def _begin(self, job, message, coro_factory, preview):
+        p = prefs(self.config)
+        self.run_out_dir = Path(p["out_dir"])
+        self.run_delete_after = p["delete_after"] * 60 if p["auto_delete"] else None
         self.preview = preview
         self.mode = job
         self.log_view.clear()
@@ -903,6 +927,10 @@ class MainWindow(QMainWindow):
             self.log(f"• {self._describe(data['path'])} — {size_ar(data['size'])}")
         elif name == "saved":
             self.log(f"✔ {self._describe(data['path'])} — {size_ar(data['size'])}")
+            if self.run_delete_after and self.run_out_dir is not None:
+                cleanup.schedule(self._cleanup_store(), [self.run_out_dir / data["path"]],
+                                 self.run_delete_after, root=self.run_out_dir)
+                self._show_cleanup_status()
         elif name == "failed":
             self.log(f"✖ فشل: {self._describe(data['path'])} — {friendly_error(data['error'])}")
         elif name == "wait":
@@ -1014,6 +1042,39 @@ class MainWindow(QMainWindow):
 
     # -- closing --------------------------------------------------------------
 
+    # -- auto-delete ------------------------------------------------------------
+
+    def _cleanup_store(self):
+        return self.cleanup_store or cleanup.store_path()
+
+    def _cleanup_tick(self):
+        store = self._cleanup_store()
+        cleanup.app_heartbeat(store)
+        deleted = cleanup.clean_due(store)
+        if deleted:
+            self.log(f"🗑 حُذف {deleted} ملف تلقائياً بعد انتهاء المدة المحددة.")
+        self._show_cleanup_status()
+
+    def _show_cleanup_status(self):
+        entries = cleanup.pending(self._cleanup_store())
+        if not entries:
+            self.cleanup_row.hide()
+            return
+        minutes = max(1, -(-int(entries[0]["at"] - clock.time()) // 60))   # round up
+        self.cleanup_label.setText(
+            f"🕒 حذف تلقائي: {len(entries)} ملف سيُحذف، أقربها بعد {minutes} دقيقة.")
+        self.cleanup_row.show()
+
+    def delete_scheduled_now(self):
+        count = len(cleanup.pending(self._cleanup_store()))
+        answer = QMessageBox.question(
+            self, "حذف الملفات",
+            f"هل تريد حذف {count} ملف منزّل الآن نهائياً بدل انتظار موعدها؟")
+        if answer == QMessageBox.Yes:
+            deleted = cleanup.clean_due(self._cleanup_store(), now=float("inf"))
+            self.log(f"🗑 حُذف {deleted} ملف.")
+            self._show_cleanup_status()
+
     def closeEvent(self, event):
         if self.job in ("download", "preview", "scan"):
             answer = QMessageBox.question(self, APP_TITLE,
@@ -1022,5 +1083,14 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             self.stop()
+        self.cleanup_timer.stop()
+        store = self._cleanup_store()
+        cleanup.app_closed(store)
+        if cleanup.pending(store):
+            # Files are still waiting to be deleted: finish the job in the background.
+            try:
+                updater.launch_detached(cleanup.helper_command())
+            except OSError:
+                pass
         self.worker.shutdown()
         event.accept()

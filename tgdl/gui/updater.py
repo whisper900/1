@@ -146,17 +146,22 @@ def cleanup_old(exe):
         pass
 
 
-def restart(exe):
-    """Start ``exe`` as a fresh, independent process."""
+def launch_detached(args):
+    """Start ``args`` as an independent process that outlives this one."""
     # A onefile exe passes its unpack folder to children through these
-    # variables; the new version must unpack its own files instead.
+    # variables; the new process must unpack its own files instead.
     env = {k: v for k, v in os.environ.items()
            if not k.startswith("_PYI_") and k != "_MEIPASS2"}
     env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
     flags = 0
     if sys.platform == "win32":
         flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-    subprocess.Popen([str(exe)], env=env, close_fds=True, creationflags=flags)
+    subprocess.Popen([str(a) for a in args], env=env, close_fds=True, creationflags=flags)
+
+
+def restart(exe):
+    """Start ``exe`` as a fresh, independent process."""
+    launch_detached([exe])
 
 
 def can_self_update():

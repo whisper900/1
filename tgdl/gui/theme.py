@@ -79,6 +79,7 @@ QTabBar::tab:selected {{ color: {ACCENT_HOVER}; border-bottom-color: {ACCENT}; f
 QTabBar::tab:hover {{ color: {TEXT}; }}
 
 QSplitter::handle {{ background: transparent; }}
+QScrollArea#page, QWidget#pageBody {{ background: {SURFACE}; border: none; }}
 QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
 QScrollBar::handle:vertical {{ background: #CDD3DC; border-radius: 4px; min-height: 30px; }}
 QScrollBar::handle:vertical:hover {{ background: #B5BDC8; }}

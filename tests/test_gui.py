@@ -107,6 +107,7 @@ def make_window(tmp_path):
     worker = FakeWorker()
     win = window_mod.MainWindow(config=config, worker=worker, autostart=False)
     win.chat_cache_path = tmp_path / "chats.json"
+    win.cleanup_store = tmp_path / "cleanup.json"
     return win, worker
 
 
@@ -793,3 +794,82 @@ def test_build_options_everything_ignores_filters():
     assert opts.filter.kinds == frozenset(KINDS)
     assert not opts.filter.exts and not opts.filter.senders and opts.filter.max_size is None
     assert opts.since is None and opts.naming == "numbers"     # saving options kept
+
+
+
+# -- auto-delete after download -------------------------------------------------
+
+def test_downloaded_files_are_scheduled_and_deleted(app, tmp_path, monkeypatch, no_dialogs):
+    from tgdl.gui import cleanup
+    win, worker = make_window(tmp_path)
+    win.config.update(auto_delete=True, delete_after=15)
+    win._refresh_summary()
+    assert any(key == "حذف تلقائي" for key, _ in __import__(
+        "tgdl.gui.settings", fromlist=["summary"]).summary(win.config))
+    win.logged_in = True
+    worker.job_done.emit("chats", CHATS)
+    win.chat_list.setCurrentRow(0)
+    win.start()
+
+    out = tmp_path / "out"
+    target = out / "العائلة" / "Ahmed" / "a.pdf"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"x")
+    worker.event.emit("saved", {"path": Path("العائلة/Ahmed/a.pdf"), "size": 1})
+    (entry,) = cleanup.pending(win.cleanup_store)
+    assert entry["path"] == str(target) and entry["root"] == str(out)
+    assert 14 * 60 < entry["at"] - __import__("time").time() <= 15 * 60
+    assert not win.cleanup_row.isHidden() and "15 دقيقة" in win.cleanup_label.text()
+
+    win.delete_scheduled_now()                       # question box answers "yes"
+    assert not target.exists() and not (out / "العائلة").exists()   # empty folders pruned
+    assert win.cleanup_row.isHidden()
+    win.close()
+
+
+def test_closing_with_pending_files_starts_the_helper(app, tmp_path, monkeypatch):
+    from tgdl.gui import cleanup, updater
+    launched = []
+    monkeypatch.setattr(updater, "launch_detached", launched.append)
+    win, _ = make_window(tmp_path)
+    cleanup.schedule(win.cleanup_store, [tmp_path / "f.pdf"], 600)
+    win.close()
+    assert launched == [cleanup.helper_command()]
+
+    win2, _ = make_window(tmp_path)
+    cleanup.clean_due(win2.cleanup_store, now=float("inf"))
+    win2.close()
+    assert len(launched) == 1                        # nothing pending: no helper
+
+
+def test_auto_delete_off_schedules_nothing(app, tmp_path):
+    from tgdl.gui import cleanup
+    win, worker = make_window(tmp_path)
+    win.logged_in = True
+    worker.job_done.emit("chats", CHATS)
+    win.chat_list.setCurrentRow(0)
+    win.start()
+    worker.event.emit("saved", {"path": Path("a.pdf"), "size": 1})
+    assert cleanup.pending(win.cleanup_store) == []
+    win.close()
+
+
+def test_settings_dialog_saves_auto_delete(app, tmp_path):
+    from tgdl.gui.settings import SettingsDialog, prefs
+    config = Config(tmp_path / "settings.json")
+    dialog = SettingsDialog(config)
+    assert not dialog.delete_after.isEnabled()
+    dialog.delete_check.setChecked(True)
+    dialog.delete_after.setValue(30)
+    dialog._save()
+    p = prefs(Config(tmp_path / "settings.json"))
+    assert p["auto_delete"] and p["delete_after"] == 30
+
+
+def test_cleanup_mode_runs_without_a_window(monkeypatch, tmp_path):
+    from tgdl.gui import app as app_mod, cleanup
+    calls = []
+    monkeypatch.setattr(cleanup, "store_path", lambda: tmp_path / "c.json")
+    monkeypatch.setattr(cleanup, "run_helper", lambda store: calls.append(store) or 0)
+    assert app_mod.main(["TelegramDownloader.exe", "--cleanup"]) == 0
+    assert calls == [tmp_path / "c.json"]

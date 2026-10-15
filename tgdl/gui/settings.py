@@ -8,8 +8,8 @@ from PySide6.QtCore import QDate, QStandardPaths, Qt
 from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox,
-    QTabWidget, QVBoxLayout, QWidget)
+    QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
+    QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
 from .. import __version__
 from ..downloader import Options
@@ -70,6 +70,8 @@ def prefs(config):
         "chat_folder": bool(config.get("chat_folder", True)),
         "type_folder": bool(config.get("type_folder", False)),
         "naming": config.get("naming", "original"),
+        "auto_delete": bool(config.get("auto_delete", False)),
+        "delete_after": int(config.get("delete_after", 15)),
     }
 
 
@@ -148,12 +150,15 @@ def summary(config):
     if p["type_folder"]:
         parts.append("النوع")
     naming = dict(NAMING_CHOICES)[p["naming"]].split(" (")[0]
-    return [
+    lines = [
         ("الأنواع", types),
         ("التصفية", " · ".join(filters) or "بدون"),
         ("الحفظ في", "  ›  ".join(parts)),
         ("التسمية", naming),
     ]
+    if p["auto_delete"]:
+        lines.append(("حذف تلقائي", f"بعد {p['delete_after']} دقيقة من تنزيل كل ملف"))
+    return lines
 
 
 class SettingsDialog(QDialog):
@@ -165,14 +170,14 @@ class SettingsDialog(QDialog):
         self.config = config
         self.require_api = require_api
         self.setWindowTitle("الإعدادات")
-        self.setMinimumSize(680, 560)
+        self.setMinimumSize(700, 640)
         p = prefs(config)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._files_tab(p), "الملفات")
-        self.tabs.addTab(self._saving_tab(p), "الحفظ والتسمية")
-        self.tabs.addTab(self._account_tab(), "حساب تليكرام")
-        self.tabs.addTab(self._about_tab(on_check_updates), "حول البرنامج")
+        self.tabs.addTab(self._scroll(self._files_tab(p)), "الملفات")
+        self.tabs.addTab(self._scroll(self._saving_tab(p)), "الحفظ والتسمية")
+        self.tabs.addTab(self._scroll(self._account_tab()), "حساب تليكرام")
+        self.tabs.addTab(self._scroll(self._about_tab(on_check_updates)), "حول البرنامج")
         self.tabs.setCurrentIndex(tab)
 
         buttons = QDialogButtonBox()
@@ -189,6 +194,16 @@ class SettingsDialog(QDialog):
         layout.addWidget(buttons)
 
     # -- tabs -------------------------------------------------------------------
+
+    @staticmethod
+    def _scroll(page):
+        """Let a tab scroll instead of squeezing its text when the window is small."""
+        area = QScrollArea(objectName="page")
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.NoFrame)
+        page.setObjectName("pageBody")
+        area.setWidget(page)
+        return area
 
     @staticmethod
     def _page():
@@ -302,6 +317,22 @@ class SettingsDialog(QDialog):
         self.example_label.setWordWrap(True)
         layout.addSpacing(6)
         layout.addWidget(self.example_label)
+
+        layout.addSpacing(6)
+        layout.addLayout(self._title(
+            "الحذف التلقائي",
+            "يحذف كل ملف نهائياً (لا يمر بسلة المحذوفات) بعد المدة المحددة من تنزيله، "
+            "حتى لا يبقى على الجهاز. إذا أغلقت البرنامج قبل الموعد يكمل الحذف في الخلفية."))
+        self.delete_check = QCheckBox("حذف الملفات المنزّلة تلقائياً بعد", checked=p["auto_delete"])
+        self.delete_after = QSpinBox(minimum=1, maximum=7 * 24 * 60, suffix=" دقيقة")
+        self.delete_after.setValue(p["delete_after"])
+        self.delete_after.setEnabled(p["auto_delete"])
+        self.delete_check.toggled.connect(self.delete_after.setEnabled)
+        delete_row = QHBoxLayout()
+        delete_row.addWidget(self.delete_check)
+        delete_row.addWidget(self.delete_after)
+        delete_row.addStretch(1)
+        layout.addLayout(delete_row)
         for signal in (self.out_edit.textChanged, self.chat_folder_check.toggled,
                        self.type_folder_check.toggled, self.naming_combo.currentIndexChanged):
             signal.connect(self._update_example)
@@ -402,6 +433,8 @@ class SettingsDialog(QDialog):
             chat_folder=self.chat_folder_check.isChecked(),
             type_folder=self.type_folder_check.isChecked(),
             naming=self.naming_combo.currentData(),
+            auto_delete=self.delete_check.isChecked(),
+            delete_after=self.delete_after.value(),
         )
         try:
             self.config.save()

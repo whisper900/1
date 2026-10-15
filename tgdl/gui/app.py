@@ -15,6 +15,10 @@ def resource(name):
 
 def main(argv=None):
     argv = list(sys.argv if argv is None else argv)
+    if "--cleanup" in argv:
+        # Background helper: delete scheduled files, no window, then exit.
+        from .cleanup import run_helper, store_path
+        return run_helper(store_path())
     selftest = "--selftest" in argv
     screenshot = None
     if "--screenshot" in argv:
